@@ -24,7 +24,10 @@ class PackagingTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="SwitchDesk-package-tests-")
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name) / "source"
+        # Match production path canonicalization (Windows short TEMP aliases and
+        # macOS /var -> /private/var); fault injection must reach the actual file.
+        self.scratch = Path(self.temporary.name).resolve()
+        self.root = self.scratch / "source"
         for directory in ("src/SwitchDesk.Core", "companion/include/switchdesk", "scripts", "docs/images", "tests", "third_party", ".github", "vendor/cache"):
             (self.root / directory).mkdir(parents=True, exist_ok=True)
         for name in ("README.md", "README.en.md", "LICENSE", "THIRD-PARTY-NOTICES.md", "Directory.Build.props", "global.json", "SwitchDesk.slnx", ".gitignore"):
@@ -47,7 +50,7 @@ class PackagingTests(unittest.TestCase):
         (self.windows / "docs/images/fixture.png").write_bytes(b"image fixture")
         (self.windows / "debug.PDB").write_bytes(b"debug fixture")
         shutil.copyfile(self.root / "build-info.json", self.windows / "build-info.json")
-        self.output = Path(self.temporary.name) / "packages"
+        self.output = self.scratch / "packages"
 
     def public_setup_fixture(self):
         relative = "StreamingSetup/SDCard/atmosphere/contents/00FF0000A53BB665/exefs.nsp"

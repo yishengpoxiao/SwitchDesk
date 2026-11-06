@@ -105,7 +105,7 @@ class ScriptPathTests(unittest.TestCase):
         licenses.mkdir(parents=True)
         (licenses / "LICENSE").write_text("fixture")
         (self.root / "docs").mkdir()
-        (self.root / "docs/USB-STREAMING.md").write_text("fixture")
+        (self.root / "docs/BUILD.md").write_text("streaming setup fixture")
         seen_extractors = []
 
         def extract_fixture(path, destination, extractor):
@@ -123,6 +123,7 @@ class ScriptPathTests(unittest.TestCase):
         self.assertEqual(seen_extractors, [str(self.root / "tools/tar")])
         self.assertTrue((self.root / "work/windows/Streaming/SysDVR/bundle-manifest.json").is_file())
         self.assertTrue((self.root / "work/setup/setup-manifest.json").is_file())
+        self.assertEqual((self.root / "work/setup/BUILD.md").read_text(), "streaming setup fixture")
         self.assertFalse((self.caller / "work").exists())
 
     def test_cnmt_output_and_compiler_paths_belong_to_the_project(self):

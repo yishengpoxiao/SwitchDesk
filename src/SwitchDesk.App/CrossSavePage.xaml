@@ -13,7 +13,7 @@
       <Button Width="268" Margin="0,0,16,16" Padding="18" HorizontalContentAlignment="Stretch" VerticalContentAlignment="Top"
        Command="{Binding DataContext.Commands[CrossSaveSelectGame],RelativeSource={RelativeSource AncestorType=UserControl}}" CommandParameter="{Binding}" AutomationProperties.Name="{Binding Name}">
        <StackPanel>
-        <DockPanel Margin="0,0,14,14"><TextBlock Text="↗" DockPanel.Dock="Right" Foreground="{DynamicResource Accent}"/><TextBlock Text="{Binding Name}" FontSize="18" FontWeight="SemiBold"/></DockPanel>
+        <Border Background="{DynamicResource Accent}" Height="3" Width="36" CornerRadius="2" HorizontalAlignment="Left" Margin="0,0,0,16"/><DockPanel Margin="0,0,14,14"><TextBlock Text="↗" DockPanel.Dock="Right" Foreground="{DynamicResource Accent}"/><TextBlock Text="{Binding Name}" FontSize="18" FontWeight="SemiBold"/></DockPanel>
         <TextBlock Text="{Binding PcStatus}" Margin="0,0,0,8"/>
         <TextBlock Text="{Binding SwitchStatus}" Margin="0,0,0,14"/>
         <TextBlock Text="{Binding SupportStatus}" Style="{StaticResource Muted}"/>
@@ -32,7 +32,7 @@
    </DockPanel>
    <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
     <StackPanel IsEnabled="{Binding CrossSave.CanSelect}">
-     <Border Background="{DynamicResource Surface}" CornerRadius="8" Padding="20" Margin="0,0,0,16">
+     <Border Background="{DynamicResource Surface}" CornerRadius="14" BorderBrush="{DynamicResource Line}" BorderThickness="1" Padding="20" Margin="0,0,0,16">
       <StackPanel>
        <DockPanel><Button Content="选择文件" Command="{Binding Commands[CrossSaveBrowse]}" DockPanel.Dock="Right"/><TextBlock Text="电脑 · Steam" FontSize="18" FontWeight="SemiBold" VerticalAlignment="Center"/></DockPanel>
        <ComboBox ItemsSource="{Binding CrossSave.Candidates}" SelectedItem="{Binding CrossSave.SelectedPc}" DisplayMemberPath="Label" Margin="0,12,0,10" AutomationProperties.Name="电脑存档与槽位"/>
@@ -40,7 +40,7 @@
        <Button Content="备份电脑存档" Command="{Binding Commands[CrossSaveBackupPc]}" HorizontalAlignment="Left"/>
       </StackPanel>
      </Border>
-     <Border Background="{DynamicResource Surface}" CornerRadius="8" Padding="20" Margin="0,0,0,16">
+     <Border Background="{DynamicResource Surface}" CornerRadius="14" BorderBrush="{DynamicResource Line}" BorderThickness="1" Padding="20" Margin="0,0,0,16">
       <StackPanel>
        <TextBlock Text="Switch" FontSize="18" FontWeight="SemiBold"/>
        <TextBlock Text="对应的 Switch 游戏" Style="{StaticResource Muted}" Margin="0,14,0,6"/>

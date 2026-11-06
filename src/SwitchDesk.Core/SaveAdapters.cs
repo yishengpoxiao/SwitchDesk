@@ -14,7 +14,7 @@ public sealed class KnightSaveAdapter(bool silksong) : ISaveAdapter
     public uint SteamAppId => silksong ? 1030300u : 367520u;
     public string Name => silksong ? "空洞骑士：丝之歌" : "空洞骑士";
     public override string ToString() => Name;
-    // Public, game-specific format constant, not a console/account key. Provenance: docs/PHASE2.md.
+    // Public, game-specific format constant, not a console/account key. Provenance: docs/BUILD.md#格式来源与许可.
     private static ReadOnlySpan<byte> FormatKey => "UKu52ePUBwetZ9wNX88o54dnfKRu0T1l"u8;
     private static ReadOnlySpan<byte> Header => [0, 1, 0, 0, 0, 255, 255, 255, 255, 1, 0, 0, 0, 0, 0, 0, 0, 6, 1, 0, 0, 0];
     public static byte[] DecodePc(ReadOnlySpan<byte> bytes)

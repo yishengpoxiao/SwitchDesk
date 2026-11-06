@@ -125,7 +125,8 @@ def publish(root, dotnet, output):
             for name in ("LICENSE", "THIRD-PARTY-NOTICES.md"):
                 shutil.copyfile(root / name, target / name)
             (target / "docs").mkdir()
-            shutil.copyfile(root / "docs/MAC.md", target / "docs/MAC.md")
+            for name in ("BUILD.md", "STATUS.md"):
+                shutil.copyfile(root / "docs" / name, target / "docs" / name)
             runtime = runtime_licenses(root, rid, target / "licenses")
             (target / "README.txt").write_text(
                 f"SwitchDesk {identity['version']} + {identity['sourceId']} ({rid})\n\n"
@@ -133,7 +134,7 @@ def publish(root, dotnet, output):
                 "Check source identity: ./SwitchDesk.Cli --version\n"
                 "If necessary: chmod +x SwitchDesk.Cli\n"
                 "This is the portable CLI, not the Windows desktop/WinUSB application.\n"
-                "The .NET runtime is included. See docs/MAC.md for features and validation limits.\n"
+                "The .NET runtime is included. See docs/BUILD.md for setup and docs/STATUS.md for validation limits.\n"
                 "Matching corresponding source is supplied alongside this archive as SwitchDesk-Source.zip.\n",
                 encoding="utf-8")
             machine = platform.machine().lower()

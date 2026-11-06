@@ -187,7 +187,7 @@ def main() -> None:
         (setup / "Sources").mkdir(exist_ok=True)
         shutil.copy2(files["sysdvr-source"], setup / "Sources" / files["sysdvr-source"].name)
         shutil.copytree(ROOT / "third_party/licenses/SysDVR", setup / "Licenses", dirs_exist_ok=True)
-        shutil.copy2(ROOT / "docs/USB-STREAMING.md", setup / "README-USB-STREAMING.md")
+        shutil.copy2(ROOT / "docs/BUILD.md", setup / "BUILD.md")
         write_json(setup / "setup-manifest.json", {"version": lock["version"], "commit": lock["commit"],
             "preparedMode": "Disabled for clean installs", "generatedConfigurationChange": "removed usb/rtsp/tcp boot markers; no invented off marker", "existingInstallRequiresOfficialSettings": True, "deployedToConsole": False,
             "files": [{"path": p.relative_to(setup).as_posix(), "size": p.stat().st_size, "sha256": sha256(p)} for p in sorted(sd.rglob("*")) if p.is_file()]})

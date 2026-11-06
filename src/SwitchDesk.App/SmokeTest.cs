@@ -184,6 +184,44 @@ public partial class MainWindow
         Width = 1050; Height = 640; Navigate("resources"); vm.Resources.SelectedTab = 0; await Render("resources-minimum-height");
         var resourceMinimumAction = Descendants<Button>(ResourcesPage).Single(b => b.Command == vm.Commands["ResourceDownload"]);
         Check(resourceMinimumAction.TransformToAncestor(Root).TransformBounds(new Rect(resourceMinimumAction.RenderSize)).Bottom <= Root.ActualHeight, "minimum-height resource action remains visible");
+        bool FitsResourceAncestors(FrameworkElement element)
+        {
+            for (var parent = VisualTreeHelper.GetParent(element); parent != null; parent = VisualTreeHelper.GetParent(parent))
+            {
+                if (parent is FrameworkElement frame)
+                {
+                    var bounds = element.TransformToAncestor(frame).TransformBounds(new Rect(element.RenderSize));
+                    var viewport = new Rect(frame.RenderSize); viewport.Inflate(.5, .5);
+                    if (!viewport.Contains(bounds)) return false;
+                }
+                if (ReferenceEquals(parent, ResourcesPage)) return true;
+            }
+            return false;
+        }
+        var resourceResults = (ListBox)ResourcesPage.FindName("ResourceResults");
+        var resourceOptions = (Expander)ResourcesPage.FindName("ResourceOptions");
+        var searchResources = (Button)ResourcesPage.FindName("SearchResourcesButton");
+        Check(!resourceOptions.IsExpanded && resourceResults.ActualHeight >= 96 && FitsResourceAncestors(resourceResults),
+            "short resource page retains a visible result viewport within every parent");
+        Check(FitsResourceAncestors(resourceMinimumAction) && FitsResourceAncestors(searchResources),
+            "short resource page keeps search and download actions unclipped by their parents");
+        var resultScroller = Descendants<ScrollViewer>(resourceResults).First();
+        resultScroller.ScrollToEnd(); await Idle();
+        Check(resultScroller.ScrollableHeight > 0 && resultScroller.VerticalOffset > 0,
+            "short resource results can scroll to the remaining entries");
+        resultScroller.ScrollToHome(); resourceOptions.IsExpanded = true; await Idle();
+        Check(resourceResults.ActualHeight >= 48 && FitsResourceAncestors(resourceMinimumAction) && FitsResourceAncestors(searchResources),
+            "expanded extra resource options preserve results and unclipped primary actions");
+        var optionsScroller = (ScrollViewer)ResourcesPage.FindName("ResourceOptionsScroller");
+        Check(optionsScroller.ScrollableHeight > 0 && optionsScroller.ActualHeight <= optionsScroller.MaxHeight + .5,
+            "extra resource options scroll within a bounded short-window region");
+        resourceOptions.IsExpanded = false;
+        vm.Resources.SelectedTab = 1; await Idle();
+        var downloadedResources = (ListBox)ResourcesPage.FindName("ResourceDownloads");
+        var installResource = Descendants<Button>(ResourcesPage).Single(b => b.Command == vm.Commands["ResourceInstall"]);
+        Check(downloadedResources.ActualHeight >= 48 && FitsResourceAncestors(downloadedResources) && FitsResourceAncestors(installResource),
+            "short downloaded-resources page keeps its list and install action inside their parents");
+        vm.Resources.SelectedTab = 0; await Idle();
         Navigate("diagnostics");
         int binds = 0, inspections = 0;
         const string fixtureUsb = "fixture-switchdesk-interface";

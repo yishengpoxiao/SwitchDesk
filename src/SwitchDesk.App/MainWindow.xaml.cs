@@ -1,4 +1,4 @@
-﻿using System.Collections.ObjectModel;
+using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
@@ -149,7 +149,7 @@ public partial class MainWindow : Window
         UpdateAutoPolicy(); LayoutDetails(); MarkNavigation(); UpdateNotice();
     }
     private void MarkNavigation()
-    { foreach (var button in Descendants<Button>(Root).Where(b => b.Command == vm.Commands["Navigate"])) { var selected = button.CommandParameter?.ToString() == vm.Page; button.SetResourceReference(BackgroundProperty, selected ? "Selected" : "Rail"); button.SetResourceReference(ForegroundProperty, selected ? "Accent" : "Secondary"); } }
+    { foreach (var button in Descendants<Button>(Sidebar).Where(b => b.Command == vm.Commands["Navigate"])) { var selected = button.CommandParameter?.ToString() == vm.Page; button.SetResourceReference(BackgroundProperty, selected ? "RailSelected" : "Rail"); button.SetResourceReference(ForegroundProperty, selected ? "RailActiveText" : "RailMuted"); } }
     private void MarkFilters()
     { foreach (var button in Descendants<Button>(LibraryPage).Where(b => b.Command == vm.Commands["Source"])) { var selected = button.CommandParameter?.ToString() == vm.Library.Source; button.SetResourceReference(BackgroundProperty, selected ? "Selected" : "Canvas"); button.SetResourceReference(ForegroundProperty, selected ? "Accent" : "Secondary"); } }
     private static IEnumerable<T> Descendants<T>(DependencyObject node) where T : DependencyObject

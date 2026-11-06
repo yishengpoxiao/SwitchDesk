@@ -24,14 +24,15 @@ class MacBuildTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="SwitchDesk-macos-tests-")
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name) / "project"
+        # tempfile may return /var while publish() resolves /private/var on macOS.
+        self.root = Path(self.temporary.name).resolve() / "project"
         (self.root / "scripts").mkdir(parents=True)
         (self.root / "docs").mkdir()
         (self.root / "src/SwitchDesk.Cli").mkdir(parents=True)
         (self.root / "caller").mkdir()
         self.identity = {"version": "fixture", "sourceId": "a" * 12, "sourceSha256": "a" * 64}
         (self.root / "build-info.json").write_text(json.dumps(self.identity))
-        for name in ("docs/MAC.md", "LICENSE", "THIRD-PARTY-NOTICES.md"):
+        for name in ("docs/BUILD.md", "docs/STATUS.md", "LICENSE", "THIRD-PARTY-NOTICES.md"):
             (self.root / name).write_text("synthetic " + name)
         self.calls = []
 
@@ -92,6 +93,12 @@ class MacBuildTests(unittest.TestCase):
                 self.assertEqual(stat.S_IMODE(member.external_attr >> 16), 0o755)
                 self.assertEqual(json.loads(archive.read("SwitchDesk/build-info.json")), self.identity)
                 self.assertIn("SwitchDesk/licenses/dotnet-LICENSE.TXT", archive.namelist())
+                for document in ("BUILD.md", "STATUS.md"):
+                    self.assertEqual(archive.read("SwitchDesk/docs/" + document).decode(), "synthetic docs/" + document)
+                readme = archive.read("SwitchDesk/README.txt").decode()
+                self.assertIn("docs/BUILD.md", readme)
+                self.assertIn("docs/STATUS.md", readme)
+                self.assertNotIn("docs/MAC.md", readme)
                 self.assertIsNone(archive.testzip())
 
     def test_second_architecture_failure_never_publishes_partial_delivery(self):

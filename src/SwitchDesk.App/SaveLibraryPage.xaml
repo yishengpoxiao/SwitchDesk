@@ -27,10 +27,10 @@
      <ItemsControl ItemsSource="{Binding SaveLibrary.Games}">
       <ItemsControl.ItemsPanel><ItemsPanelTemplate><WrapPanel/></ItemsPanelTemplate></ItemsControl.ItemsPanel>
       <ItemsControl.ItemTemplate><DataTemplate>
-       <Button Width="244" Margin="0,0,16,16" Padding="16" HorizontalContentAlignment="Stretch"
+       <Button Width="244" Margin="0,0,16,16" Padding="18" HorizontalContentAlignment="Stretch"
         Command="{Binding DataContext.SaveLibrary.OpenGameCommand,RelativeSource={RelativeSource AncestorType=UserControl}}" CommandParameter="{Binding}">
         <StackPanel>
-         <Border Height="90" Background="{DynamicResource Selected}" CornerRadius="6" Margin="0,0,0,12"><TextBlock Text="{Binding Initial}" Foreground="{DynamicResource Accent}" FontSize="34" HorizontalAlignment="Center" VerticalAlignment="Center"/></Border>
+         <Border Height="54" Width="54" HorizontalAlignment="Left" Background="{DynamicResource Selected}" CornerRadius="16" Margin="0,0,0,16"><TextBlock Text="{Binding Initial}" Foreground="{DynamicResource Accent}" FontSize="26" HorizontalAlignment="Center" VerticalAlignment="Center"/></Border>
          <TextBlock Text="{Binding Name}" FontWeight="SemiBold" FontSize="16" MinHeight="44"/>
          <TextBlock Text="{Binding Status}" Foreground="{DynamicResource Secondary}" Margin="0,8,0,6"/>
          <TextBlock Text="{Binding CountText}" Style="{StaticResource Muted}"/>

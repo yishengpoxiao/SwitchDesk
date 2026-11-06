@@ -1,0 +1,210 @@
+name: Build and publish development release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/release.yml
+      - scripts/assemble-release.py
+      - version.json
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+jobs:
+  version:
+    if: github.repository == 'yishengpoxiao/SwitchDesk' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - id: version
+        run: |
+          python3 - <<'PY'
+          import json, os, re
+          version = json.load(open('version.json'))['version']
+          if not re.fullmatch(r'\d+\.\d+\.\d+-(?:dev|alpha|beta|rc)\.\d+', version):
+              raise SystemExit('This workflow only publishes explicit development versions')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'version={version}\ntag=v{version}\n')
+          PY
+
+  native:
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      UBSAN_OPTIONS: halt_on_error=1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=address,undefined -fno-omit-frame-pointer -Icompanion/include companion/tests/native_tests.cpp -o native-tests
+      - run: ./native-tests
+      - run: g++ -std=c++20 -O1 -g -Wall -Wextra -Wpedantic -Werror -fsanitize=address,undefined -fno-omit-frame-pointer companion/tests/argv_tests.cpp -o argv-tests
+      - run: ./argv-tests
+      - run: python3 scripts/test-cnmt.py --sanitize --verify-regression
+      - run: python3 tests/test_release.py
+
+  windows:
+    needs: version
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/cache@v4
+        with:
+          path: vendor/streaming/cache
+          key: ${{ runner.os }}-streaming-${{ hashFiles('streaming-dependencies.lock.json') }}
+      - shell: pwsh
+        run: ./scripts/build.ps1 -Dotnet dotnet -Python python
+      - run: python scripts/prepare-companion.py
+      - run: python scripts/package.py --windows artifacts/Windows --output artifacts/Packages
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: artifacts/Packages/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  macos:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 tests/test_macos_build.py
+      - run: python3 scripts/build-macos.py --dotnet dotnet
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-macos-${{ matrix.arch }}
+          path: |
+            artifacts/macOS/SwitchDesk-macOS-${{ matrix.arch }}.zip
+            artifacts/macOS/macos-manifest.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  companion:
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    container: devkitpro/devkita64:latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: dkp-pacman -Syu --noconfirm --needed switch-dev switch-cmake deko3d switch-curl switch-glm switch-zlib switch-mbedtls dkp-toolchain-vars
+      - run: bash scripts/build-companion.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-companion
+          path: artifacts/Switch/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  assemble:
+    needs: [version, native, windows, macos, companion]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: artifacts/ReleaseInputs
+      - run: python3 scripts/build-info.py
+      - run: python3 scripts/assemble-release.py --inputs artifacts/ReleaseInputs --output artifacts/Release --commit "$GITHUB_SHA"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: verified-release
+          path: artifacts/Release/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    needs: [version, assemble]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: verified-release
+          path: release
+      - name: Publish matching prerelease without replacing existing assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          cd release
+          sha256sum --strict --check SHA256SUMS.txt
+          refs=$(gh api "repos/$GH_REPO/git/matching-refs/tags/$RELEASE_TAG" --jq 'length')
+          if [ "$refs" != 0 ]; then
+            echo 'Refusing to replace an existing release tag. Use a new version.' >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" \
+            SwitchDesk-Windows-x64.zip SwitchDesk-macOS-arm64.zip SwitchDesk-macOS-x64.zip \
+            SwitchDesk-Switch.zip SwitchDesk-Source.zip build-info.json release-manifest.json SHA256SUMS.txt \
+            --target "$GITHUB_SHA" --prerelease --latest=false \
+            --title "SwitchDesk $RELEASE_VERSION · 一生破晓" --notes-file RELEASE-NOTES.md
+          test "$(gh api "repos/$GH_REPO/commits/$RELEASE_TAG" --jq .sha)" = "$GITHUB_SHA"
+          gh release view "$RELEASE_TAG" --json url,isDraft,isPrerelease,assets > published.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          published = json.loads(Path('published.json').read_text())
+          expected = {line.split('  ', 1)[1] for line in Path('SHA256SUMS.txt').read_text().splitlines()}
+          expected.add('SHA256SUMS.txt')
+          assets = published['assets']
+          if (published['isDraft'] or not published['isPrerelease']
+                  or {asset['name'] for asset in assets} != expected
+                  or any(asset['size'] != Path(asset['name']).stat().st_size for asset in assets)):
+              raise SystemExit('Published release metadata or asset sizes differ')
+          print(published['url'])
+          PY

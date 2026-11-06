@@ -31,13 +31,18 @@ public static class ThemeManager
         if (!listening) { SystemEvents.UserPreferenceChanged += (_, _) => Application.Current?.Dispatcher.BeginInvoke(() => Apply(Preference)); listening = true; }
         var setting = Registry.GetValue(@"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize", "AppsUseLightTheme", 1);
         Dark = preference == "Dark" || preference == "System" && setting is int n && n == 0;
-        var colors = Dark ? new[] { "#101722", "#1A2433", "#202D3E", "#2B3B52", "#F0F4FC", "#AFBCD0", "#34445A", "#9BB8FF", "#263D63", "#151F2D", "#FFB4AB" }
-            : new[] { "#F6F8FC", "#FFFFFF", "#EDF1F7", "#E3EBF8", "#202D40", "#5E6E86", "#DCE3EE", "#315FDB", "#E8EEFC", "#EDF2F9", "#B64141" };
+        var colors = Dark ? new[] { "#17181A", "#232528", "#2C2E31", "#383432", "#F7F3ED", "#BBB4AB", "#41403E", "#FF9D72", "#483229", "#101214", "#FFB4AB" }
+            : new[] { "#F5F1EB", "#FFFDFA", "#EFE8DF", "#F8E5D9", "#29251F", "#75695D", "#E3D8CB", "#B7431D", "#FCE2D3", "#242625", "#B64141" };
         string[] keys = ["Canvas", "Surface", "Subtle", "Hover", "Text", "Secondary", "Line", "Accent", "Selected", "Rail", "Error"];
         for (var i = 0; i < keys.Length; i++) Application.Current.Resources[keys[i]] = new SolidColorBrush((Color)ColorConverter.ConvertFromString(colors[i]));
-        Application.Current.Resources["OnAccent"] = new SolidColorBrush(Dark ? Color.FromRgb(17, 43, 87) : Colors.White);
-        Application.Current.Resources["AccentHover"] = new SolidColorBrush((Color)ColorConverter.ConvertFromString(Dark ? "#A8C0FF" : "#1E50BE"));
+        Application.Current.Resources["OnAccent"] = new SolidColorBrush(Dark ? Color.FromRgb(46, 28, 20) : Colors.White);
+        Application.Current.Resources["AccentHover"] = new SolidColorBrush((Color)ColorConverter.ConvertFromString(Dark ? "#FFB28D" : "#993516"));
         Application.Current.Resources["Success"] = new SolidColorBrush((Color)ColorConverter.ConvertFromString(Dark ? "#70D5B7" : "#318A76"));
+        foreach (var pair in new Dictionary<string, string>
+        {
+            ["RailText"] = "#F7F3ED", ["RailMuted"] = "#B8B9B3", ["RailSurface"] = Dark ? "#202326" : "#303431",
+            ["RailHover"] = "#40403B", ["RailSelected"] = "#F59B71", ["RailActiveText"] = "#2F211A", ["RailLine"] = "#484A44"
+        }) Application.Current.Resources[pair.Key] = new SolidColorBrush((Color)ColorConverter.ConvertFromString(pair.Value));
         if (SystemParameters.HighContrast)
         {
             Application.Current.Resources["Text"] = SystemColors.WindowTextBrush;
@@ -53,6 +58,10 @@ public static class ThemeManager
             Application.Current.Resources["OnAccent"] = SystemColors.HighlightTextBrush;
             Application.Current.Resources["AccentHover"] = SystemColors.HighlightBrush;
             Application.Current.Resources["Success"] = SystemColors.WindowTextBrush;
+            foreach (var key in new[] { "RailText", "RailMuted", "RailLine" }) Application.Current.Resources[key] = SystemColors.WindowTextBrush;
+            foreach (var key in new[] { "RailSurface", "RailHover" }) Application.Current.Resources[key] = SystemColors.WindowBrush;
+            Application.Current.Resources["RailSelected"] = SystemColors.HighlightBrush;
+            Application.Current.Resources["RailActiveText"] = SystemColors.HighlightTextBrush;
         }
         foreach (Window window in Application.Current.Windows) ApplyCaption(window);
         Application.Current.Resources["MotionDuration"] = new Duration(TimeSpan.FromMilliseconds(SystemParameters.ClientAreaAnimation ? 140 : 0));

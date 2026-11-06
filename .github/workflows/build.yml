@@ -60,7 +60,7 @@ jobs:
     container: devkitpro/devkita64:latest
     steps:
       - uses: actions/checkout@v4
-      - run: pacman -Syu --noconfirm switch-dev switch-cmake deko3d switch-curl switch-glm switch-zlib switch-mbedtls dkp-toolchain-vars cmake ninja python git
+      - run: dkp-pacman -Syu --noconfirm --needed switch-dev switch-cmake deko3d switch-curl switch-glm switch-zlib switch-mbedtls dkp-toolchain-vars
       - run: bash scripts/build-companion.sh
       - uses: actions/upload-artifact@v4
         with:
