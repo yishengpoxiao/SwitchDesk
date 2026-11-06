@@ -102,9 +102,10 @@ public static class Transfers
     {
         PathSafety.Remote(remotePath);
         if (File.Exists(destination)) throw new IOException("目标文件已存在，请选择其他名称");
+        // The final name may already be at the filesystem's component limit.
+        var partial = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(destination))!, ".switchdesk-" + Guid.NewGuid().ToString("N") + ".partial");
         var open = await client.QueryAsync<JsonElement>("fs.read.open", new { path = remotePath }, ct);
         var handle = open.GetProperty("handle").GetString()!;
-        var partial = destination + "." + Guid.NewGuid().ToString("N") + ".partial";
         try
         {
             if (!open.TryGetProperty("size", out var length) || length.ValueKind != JsonValueKind.Number || !length.TryGetInt64(out var size) || size < 0)

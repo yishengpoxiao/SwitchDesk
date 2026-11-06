@@ -1,6 +1,9 @@
 """Offline regressions for rebuilding the companion overlay from pinned source."""
 from pathlib import Path
+from unittest import mock
 import hashlib
+import importlib.util
+import io
 import json
 import re
 import shutil
@@ -12,6 +15,56 @@ import zipfile
 
 
 REPOSITORY = Path(__file__).resolve().parents[1]
+SPEC = importlib.util.spec_from_file_location("prepare_companion", REPOSITORY / "scripts/prepare-companion.py")
+preparation = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(preparation)
+
+
+class CompanionDownloadTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="SwitchDesk-download-tests-")
+        self.addCleanup(self.temporary.cleanup)
+        self.directory = Path(self.temporary.name)
+        self.target = self.directory / "dependency.zip"
+        self.payload = b"complete synthetic source archive"
+        self.digest = hashlib.sha256(self.payload).hexdigest()
+
+    def download(self):
+        with mock.patch("builtins.print"):
+            preparation.download("https://example.invalid/source.zip", self.target, self.digest)
+
+    def test_interrupted_download_leaves_no_cache_and_retry_downloads_complete_source(self):
+        class Interrupted(io.BytesIO):
+            def read(self, size=-1):
+                if self.tell():
+                    raise OSError("synthetic connection interruption")
+                return super().read(size)
+
+        with mock.patch.object(preparation.urllib.request, "urlopen", return_value=Interrupted(b"partial")):
+            with self.assertRaises(OSError):
+                self.download()
+        self.assertEqual(list(self.directory.iterdir()), [])
+        with mock.patch.object(preparation.urllib.request, "urlopen", return_value=io.BytesIO(self.payload)) as retry:
+            self.download()
+            retry.assert_called_once()
+        self.assertEqual(self.target.read_bytes(), self.payload)
+        self.assertEqual(list(self.directory.iterdir()), [self.target])
+
+    def test_checksum_failure_is_not_published_or_left_for_future_downloads(self):
+        with mock.patch.object(preparation.urllib.request, "urlopen", return_value=io.BytesIO(b"wrong archive")):
+            with self.assertRaisesRegex(RuntimeError, "checksum mismatch"):
+                self.download()
+        self.assertEqual(list(self.directory.iterdir()), [])
+        with mock.patch.object(preparation.urllib.request, "urlopen", return_value=io.BytesIO(self.payload)):
+            self.download()
+        self.assertEqual(self.target.read_bytes(), self.payload)
+
+    def test_existing_cache_is_not_modified_or_downloaded_again(self):
+        self.target.write_bytes(self.payload)
+        with mock.patch.object(preparation.urllib.request, "urlopen") as connection:
+            self.download()
+            connection.assert_not_called()
+        self.assertEqual(self.target.read_bytes(), self.payload)
 
 
 class CompanionPreparationTests(unittest.TestCase):

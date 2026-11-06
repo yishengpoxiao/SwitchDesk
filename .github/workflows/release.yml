@@ -8,6 +8,12 @@ on:
       - scripts/assemble-release.py
       - version.json
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the verified assets as a GitHub prerelease
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -180,6 +186,7 @@ jobs:
           retention-days: 7
 
   publish:
+    if: github.event_name == 'workflow_dispatch' && inputs.publish
     needs: [version, assemble]
     runs-on: ubuntu-latest
     timeout-minutes: 20

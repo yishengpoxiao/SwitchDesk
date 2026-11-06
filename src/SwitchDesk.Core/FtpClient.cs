@@ -88,7 +88,8 @@ public sealed class FtpClient : IDisposable, IAsyncDisposable
     {
         var remote = CommandPath(remotePath, writable: false);
         if (File.Exists(destination)) throw new IOException("目标文件已存在，请选择其他名称");
-        var partial = destination + "." + Guid.NewGuid().ToString("N") + ".partial";
+        // Keep staging on the destination volume without extending its filename.
+        var partial = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(destination))!, ".switchdesk-" + Guid.NewGuid().ToString("N") + ".partial");
         try
         {
             var size = await SizeAsync(remote, ct);
@@ -310,21 +311,23 @@ public sealed class FtpClient : IDisposable, IAsyncDisposable
         if (total.HasValue && completed != total.Value) throw new EndOfStreamException("传输长度与文件大小不一致，文件未完整传输");
     }
 
-    /// <summary>取消传输后发送 ABOR，并按「静默窗口」排空服务器可能补发的回复；控制连接保持可用。</summary>
+    /// <summary>用 ABOR 后的 NOOP 回复确认旧传输回复已排空；超时则关闭无法确认同步的连接。</summary>
     private async Task AbortAsync()
     {
         try
         {
-            await writer!.WriteLineAsync("ABOR");
-            using var idle = new CancellationTokenSource(TimeSpan.FromMilliseconds(800));
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+            await writer!.WriteLineAsync("ABOR".AsMemory(), timeout.Token);
+            await writer.WriteLineAsync("NOOP".AsMemory(), timeout.Token);
             while (true)
             {
-                var (code, _) = await ReadReplyAsync(idle.Token);
-                if (code / 100 == 2) idle.CancelAfter(TimeSpan.FromMilliseconds(400));
+                var (code, _) = await ReadReplyAsync(timeout.Token);
+                // Transfer/ABOR replies use 125/150/225/226/250/426. Only
+                // the subsequent NOOP's 200 establishes a drained boundary.
+                if (code == 200) return;
             }
         }
-        catch (OperationCanceledException) { }
-        catch (Exception ex) when (ex is IOException or ObjectDisposedException or EndOfStreamException) { IsConnected = false; }
+        catch (Exception ex) when (ex is IOException or OperationCanceledException or ObjectDisposedException) { CloseControl(); }
     }
 
     private async Task<IPEndPoint> PassiveEndpointAsync(CancellationToken ct)

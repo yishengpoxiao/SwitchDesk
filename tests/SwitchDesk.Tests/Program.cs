@@ -40,6 +40,7 @@ internal static partial class Program
         await Audit2ResourceTestsAsync();
         await Audit2SaveTestsAsync();
         await Audit2TransferTestsAsync();
+        await TransferBoundaryTestsAsync();
         await ResourceDownloadTestsAsync();
         await PublicResourceSitesTestsAsync();
         await GamerCookieSearchTestsAsync();

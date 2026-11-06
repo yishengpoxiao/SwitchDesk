@@ -154,8 +154,8 @@ def assemble(root, inputs, output, commit):
         (stage / "RELEASE-NOTES.md").write_text(
             f"SwitchDesk **{identity['version']}** · 一生破晓\n\n"
             "基于 [Humboldt-Zh/SwitchDesk](https://github.com/Humboldt-Zh/SwitchDesk) 改进，保留原项目与第三方许可。\n\n"
-            "更新破晓主题与应用图标，统一一生破晓署名；修复资源页短窗口布局，精简 README 和历史文档，"
-            "并包含文件／快照可靠性及跨平台构建回归修复。\n\n"
+            "修复 USB／FTP 长文件名下载、取消后迟到回复造成的 FTP 连接失步，以及依赖下载中断后的缓存重试；"
+            "资源搜索新增固定取消入口，长错误提示不再挤占结果列表。\n\n"
             "包含 Windows x64、macOS Apple Silicon / Intel CLI、Switch 配套、完整对应源码和 SHA256SUMS.txt。"
             "下载后先核对摘要；Windows 解压运行 SwitchDesk.exe，Mac 在终端使用 SwitchDesk.Cli --help。\n\n"
             "本轮通过自动软件检查与目标构建；未进行真机验收。迁移准入仍为空，原生 HOME 隐藏关闭。"

@@ -91,6 +91,7 @@ internal static partial class Program
                     await Invoke("SearchResourcesAsync"); await FlushUi();
                     Assert(vm.Page == "resources" && ((FrameworkElement)window.FindName("ResourcesPage")).IsVisible && vm.Resources.Results.Count == 1);
                     Assert(vm.Resources.SelectedResult?.Entry?.TitleId == Peer.Save.TitleId && vm.Commands["ResourceDownload"].CanExecute(null));
+                    await ResourceSearchUiTestsAsync(window);
                     foreach (var changeType in new[] { false, true })
                     {
                         var searchGate = Get<SemaphoreSlim>("jobsGate"); await searchGate.WaitAsync();

@@ -1,14 +1,21 @@
 """Prepare the corresponding GPL source tree and a reproducible Sphaira overlay."""
 from pathlib import Path
-import argparse, hashlib, re, shutil, urllib.request, zipfile, subprocess, sys, os
+import argparse, hashlib, re, shutil, urllib.request, zipfile, subprocess, sys, os, tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-def download(url: str, destination: Path):
+def download(url: str, destination: Path, expected_sha256: str | None = None):
     destination.parent.mkdir(parents=True, exist_ok=True)
     if not destination.exists():
         print(f"Downloading {url}", flush=True)
-        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "SwitchDesk-build/0.1"}), timeout=120) as source, destination.open("wb") as out:
-            shutil.copyfileobj(source, out)
+        # Keep interrupted or mismatched downloads out of the reusable cache.
+        # The sibling staging directory keeps publication on the same volume.
+        with tempfile.TemporaryDirectory(prefix=".SwitchDesk-download-", dir=destination.parent) as temporary:
+            staged = Path(temporary) / destination.name
+            with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "SwitchDesk-build/0.1"}), timeout=120) as source, staged.open("wb") as out:
+                shutil.copyfileobj(source, out)
+            if expected_sha256 and hashlib.sha256(staged.read_bytes()).hexdigest() != expected_sha256.lower():
+                raise RuntimeError("Downloaded source archive checksum mismatch: " + destination.name)
+            staged.replace(destination)
 
 def unpack(archive: Path, destination: Path):
     with zipfile.ZipFile(archive) as z:
@@ -31,10 +38,11 @@ def main():
     subprocess.run([sys.executable, str(ROOT / "scripts/build-info.py")], check=True)
     p = argparse.ArgumentParser(); p.add_argument("--destination", type=Path, default=ROOT / "vendor/sphaira"); p.add_argument("--offline", action="store_true"); args = p.parse_args()
     destination = (ROOT / args.destination).resolve(); archive = ROOT / "third_party/Sphaira-1.0.8-source.zip"
+    digest_file = archive.with_suffix(archive.suffix + ".sha256")
     if not archive.exists():
         if args.offline: raise RuntimeError("Missing pinned source archive")
-        download("https://codeload.github.com/NaGaa95/sphaira/zip/338348e74b6d278bc570a9be5373d25197bf6c8d", archive)
-    digest_file = archive.with_suffix(archive.suffix + ".sha256")
+        download("https://codeload.github.com/NaGaa95/sphaira/zip/338348e74b6d278bc570a9be5373d25197bf6c8d", archive,
+                 digest_file.read_text().strip() if digest_file.exists() else None)
     if digest_file.exists() and hashlib.sha256(archive.read_bytes()).hexdigest() != digest_file.read_text().strip(): raise RuntimeError("Upstream archive checksum mismatch")
     if not (destination / "sphaira/source/main.cpp").exists(): unpack(archive, destination)
     for folder in ("include", "source"):
@@ -239,7 +247,7 @@ def main():
             if name in seen: continue
             seen.add(name)
             dep = ROOT / "vendor/deps" / name; bundle = ROOT / "vendor/cache" / (name + "-" + ref + ".zip")
-            if not bundle.exists() and not args.offline: download(f"https://codeload.github.com/{repo}/zip/{ref}", bundle)
+            if not bundle.exists() and not args.offline: download(f"https://codeload.github.com/{repo}/zip/{ref}", bundle, expected.get(bundle.name))
             if bundle.exists() and bundle.name in expected and hashlib.sha256(bundle.read_bytes()).hexdigest() != expected[bundle.name]: raise RuntimeError("Dependency hash mismatch: " + name)
             if not dep.exists():
                 if not bundle.exists():

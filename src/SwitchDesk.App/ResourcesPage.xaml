@@ -6,6 +6,7 @@
   <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
   <StackPanel Margin="0,0,0,8">
    <DockPanel>
+    <Button x:Name="CancelResourceSearchButton" Content="取消搜索" Command="{Binding Commands[ResourceCancelSearch]}" DockPanel.Dock="Right" Margin="10,0,0,0" Visibility="{Binding Resources.IsBusy,Converter={StaticResource Visible}}"/>
     <Button x:Name="SearchResourcesButton" Content="搜索资源" Command="{Binding Commands[ResourceSearch]}" Style="{StaticResource Primary}" DockPanel.Dock="Right" Margin="10,0,0,0"/>
     <TextBox x:Name="ResourceSearchBox" Text="{Binding Resources.SearchText,UpdateSourceTrigger=PropertyChanged}" Style="{StaticResource SearchField}" Tag="搜索游戏、工具或金手指"
      PreviewKeyDown="OnSearchKeyDown" AutomationProperties.Name="搜索资源名称" ToolTip="搜索游戏、Homebrew、金手指或插件 · Ctrl+F"/>
@@ -15,7 +16,7 @@
     <ComboBox ItemsSource="{Binding Resources.Sources}" SelectedItem="{Binding Resources.SelectedSource}" DisplayMemberPath="Label" Width="190" AutomationProperties.Name="资源来源" Margin="0,0,16,6"/>
     <TextBlock Text="类型" Style="{StaticResource Muted}" VerticalAlignment="Center" Margin="0,0,8,6"/>
     <ComboBox ItemsSource="{Binding Resources.Types}" SelectedItem="{Binding Resources.SelectedType}" Width="130" AutomationProperties.Name="资源类型筛选" Margin="0,0,16,6"/>
-    <TextBlock Text="{Binding Resources.Status}" Style="{StaticResource Muted}" VerticalAlignment="Center" Margin="0,0,0,6" MaxWidth="460"/>
+    <TextBlock Text="{Binding Resources.Status}" Style="{StaticResource Muted}" VerticalAlignment="Center" Margin="0,0,0,6" MaxWidth="460" TextWrapping="NoWrap" TextTrimming="CharacterEllipsis" ToolTip="{Binding Resources.Status}"/>
    </WrapPanel>
    <ProgressBar IsIndeterminate="True" Visibility="{Binding Resources.IsBusy,Converter={StaticResource Visible}}" Margin="0,2,0,0"/>
   </StackPanel>
@@ -33,7 +34,6 @@
       <Button Content="浏览器站内搜索 ↗" Command="{Binding Commands[ResourceSearchWeb]}" Margin="0,0,8,8"/>
       <Button Content="搜索公开索引 ↗" Command="{Binding Commands[ResourceSearchIndex]}" Margin="0,0,8,8" ToolTip="用 Bing 查询所选网站已收录的公开文章；可能与站内结果不同"/>
       <Button Content="官方公告 ↗" Command="{Binding Commands[ResourceSiteNotice]}" Visibility="{Binding Resources.IsNstSite,Converter={StaticResource Visible}}" Margin="0,0,8,8"/>
-      <Button Content="取消搜索" Command="{Binding Commands[ResourceCancelSearch]}" Margin="0,0,0,8"/>
      </WrapPanel>
     </StackPanel>
    </ScrollViewer>

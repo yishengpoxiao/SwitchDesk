@@ -108,7 +108,7 @@ CI 配置位于 [GitHub 工作流](../.github/workflows/)，实际执行结果�
 
 本地打包使用 `python scripts/package.py --windows artifacts/Windows --output artifacts/Packages`。脚本复用构建来源生成器，拒绝源码已经变化的旧 Windows 构建；源码 ZIP 只从 `vendor/cache` 加入锁文件列出的依赖源码，并核对摘要。请先完成配套依赖准备；缺少或损坏的源码归档会中止打包。输出目录须在 Windows 构建目录之外，已有同名交付文件会保留，请改用新的输出目录。此命令只生成本地文件，不发布 Release。
 
-[开发版发布工作流](../.github/workflows/release.yml)在主仓库 `main` 的版本配置或发布流程更新时运行，也可手动触发。它复用现有 Windows、双架构 Mac 与 Switch 构建，完成软件检查后统一核对完整来源标识、对应源码依赖和摘要，发布 `version.json` 对应的预览标签；仅最终发布任务持有内容写权限。已有标签不会被覆盖，失败时查看对应 Actions 记录。自动构建与发布不表示设备验收通过。
+[开发版发布工作流](../.github/workflows/release.yml)在主仓库 `main` 的版本配置或发布流程更新时运行，也可手动触发。它复用现有 Windows、双架构 Mac 与 Switch 构建，完成软件检查后统一核对完整来源标识、对应源码依赖和摘要，生成可供本地上传的 `verified-release` 产物。默认不公开发布；仅手动触发并明确勾选 `publish` 时，最终发布任务才持有内容写权限并创建预览标签。已有标签不会被覆盖，失败时查看对应 Actions 记录。自动构建与发布不表示设备验收通过。
 
 ## 随包播放器
 
