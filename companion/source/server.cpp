@@ -1,0 +1,882 @@
+// SwitchDesk remote management mode for Sphaira 1.0.8. GPL-3.0.
+#include "switchdesk/server.hpp"
+#include "switchdesk/management_view.hpp"
+#include "switchdesk/safety.hpp"
+#include "switchdesk/restore_policy.hpp"
+#include "switchdesk/operation_log.hpp"
+#include "switchdesk/dbi_launch.hpp"
+#include "switchdesk/export_reads.hpp"
+#include "switchdesk/wire.hpp"
+#include "switchdesk/build_info.hpp"
+#include "switchdesk/cnmt.hpp"
+#include "switchdesk/install_hash_policy.hpp"
+#include "switchdesk/install_signature_policy.hpp"
+#include "app.hpp"
+#include "title_info.hpp"
+#include "usb/usbds.hpp"
+#include "ui/progress_box.hpp"
+#include "ui/menus/game_menu.hpp"
+#include "yati/yati.hpp"
+#include "yati/container/nsp.hpp"
+#include "yati/container/xci.hpp"
+#include "yati/nx/nca.hpp"
+#include "yati/nx/ncm.hpp"
+#include "yati/nx/keys.hpp"
+#include <yyjson.h>
+#include <switch.h>
+#include <atomic>
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <dirent.h>
+#include <fcntl.h>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <ranges>
+#include <set>
+#include <string>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <vector>
+
+extern "C" u32 __nx_applet_exit_mode;
+
+namespace switchdesk {
+namespace {
+using namespace sphaira;
+constexpr auto Failure = MAKERESULT(345, 1);
+std::atomic_llong progress_done{}, progress_total{};
+std::mutex request_mutex;
+bool transfer_open{}, dbi_scheduled{}; // protected by request_mutex
+using File = std::unique_ptr<FILE, decltype(&std::fclose)>;
+auto Open(const std::string& path, const char* mode) -> File { return File(std::fopen(path.c_str(), mode), &std::fclose); }
+auto Hex(u64 value) -> std::string { char text[17]{}; std::snprintf(text, sizeof(text), "%016llX", static_cast<unsigned long long>(value)); return text; }
+struct DbiLaunchResult {
+    const char* path{};
+    const char* code{};
+    std::string message;
+};
+// Caller owns request_mutex, so a local button press cannot interrupt a USB operation.
+auto ScheduleDbi() -> DbiLaunchResult {
+    if (transfer_open || dbi_scheduled) return {nullptr, "DbiBusy", "主机任务尚未结束，请稍后打开 DBI"};
+    if (!envHasNextLoad()) return {nullptr, "DbiUnsupported", "当前启动环境不支持打开其他 NRO，请从 hbmenu 手动打开 DBI"};
+    for (const auto path : DbiPaths) {
+        const auto full = std::string("sdmc:") + path;
+        auto file = Open(full, "rb");
+        if (!file && errno == ENOENT) continue;
+        struct stat info{}; NroStart start{}; NroHeader header{};
+        if (!file || fstat(fileno(file.get()), &info) || !S_ISREG(info.st_mode) || info.st_size < 0 ||
+            std::fread(&start, 1, sizeof(start), file.get()) != sizeof(start) ||
+            std::fread(&header, 1, sizeof(header), file.get()) != sizeof(header) ||
+            !ValidDbiImage(header, info.st_size)) return {nullptr, "DbiInvalid", full + " 无法读取或 NRO 文件头无效"};
+        // Both fixed paths fit hbloader's buffers and contain no spaces. Passing
+        // argv[0] lets DBI resolve files alongside its NRO. Sphaira's nro_launch
+        // also posts an immediate exit event, which could race the USB reply.
+        const auto rc = envSetNextLoad(full.c_str(), full.c_str());
+        if (R_FAILED(rc)) return {nullptr, "DbiLaunchFailed", "登记 DBI 启动失败，Result=" + Hex(rc)};
+        dbi_scheduled = true;
+        return {path, nullptr, {}};
+    }
+    return {nullptr, "DbiMissing", "未找到 /switch/DBI/DBI.nro 或 /switch/DBI.nro，请核对 SD 卡上的 DBI 位置"};
+}
+auto Uid(AccountUid uid) -> std::string { return Hex(uid.uid[0]) + Hex(uid.uid[1]); }
+auto Storage(u8 id) -> const char* { return id == NcmStorageId_SdCard ? "SdCard" : id == NcmStorageId_GameCard ? "GameCard" : "BuiltInUser"; }
+auto MetaKind(u8 type) -> const char* { return type == NcmContentMetaType_Application ? "Base" : type == NcmContentMetaType_Patch ? "Update" : type == NcmContentMetaType_DataPatch ? "DataPatch" : "DLC"; }
+auto Environment() -> std::string {
+    if (!App::IsEmummc()) return "sysMMC";
+    const auto& paths = App::GetApp()->m_emummc_paths; std::array<u8, 32> hash{}; sha256CalculateHash(hash.data(), &paths, sizeof(paths));
+    char id[13]{}; for (unsigned i = 0; i < 6; ++i) std::snprintf(id + i * 2, 3, "%02X", hash[i]);
+    return std::string("emuMMC-") + id;
+}
+auto DeviceId() -> std::string {
+    static std::string value;
+    if (!value.empty()) return value;
+    u64 hardware{};
+    if (R_SUCCEEDED(splGetConfig(SplConfigItem_DeviceId, &hardware)) && hardware != 0) {
+        std::array<u8, 32> digest{}; sha256CalculateHash(digest.data(), &hardware, sizeof(hardware));
+        for (unsigned i = 0; i < 16; ++i) { char hex[3]{}; std::snprintf(hex, sizeof(hex), "%02X", digest[i]); value += hex; }
+        return value;
+    }
+    mkdir("sdmc:/switch/SwitchDesk", 0777);
+    if (auto file = Open("sdmc:/switch/SwitchDesk/device.id", "rb")) { char data[33]{}; if (std::fread(data, 1, 32, file.get()) == 32) value = data; }
+    if (value.empty()) { value = Hex(randomGet64()) + Hex(randomGet64()); if (auto file = Open("sdmc:/switch/SwitchDesk/device.id", "wb")) std::fwrite(value.data(), 1, value.size(), file.get()); }
+    return value;
+}
+auto Mkdirs(const std::string& path) -> bool {
+    for (std::size_t i = path.find(":/") + 2; i < path.size(); ++i) if (path[i] == '/') {
+        if (mkdir(path.substr(0, i).c_str(), 0777) && errno != EEXIST) return false;
+    }
+    return !mkdir(path.c_str(), 0777) || (errno == EEXIST && [&]{ struct stat s{}; return !stat(path.c_str(), &s) && S_ISDIR(s.st_mode); }());
+}
+struct TreeItem { std::string path; bool directory{}; u64 size{}; };
+auto Tree(const std::string& root, const std::string& relative, std::vector<TreeItem>& output, unsigned depth = 0) -> bool {
+    if (depth > 64) return false;
+    const auto current = root + (relative.empty() ? "" : '/' + relative);
+    auto dir = std::unique_ptr<DIR, decltype(&closedir)>(opendir(current.c_str()), &closedir); if (!dir) return false;
+    for (;;) {
+        errno = 0;
+        const auto entry = readdir(dir.get());
+        if (!entry) return errno == 0 || errno == ENOENT; // libnx uses ENOENT at end of directory.
+        const auto name = std::string(entry->d_name); if (name == "." || name == "..") continue;
+        if (output.size() >= 100000) return false;
+        const auto path = relative.empty() ? name : relative + '/' + name; if (!ValidRelative(path)) return false;
+        struct stat info{}; if (stat((root + '/' + path).c_str(), &info)) return false;
+        const auto is_dir = S_ISDIR(info.st_mode); output.push_back({path, is_dir, static_cast<u64>(info.st_size)});
+        if (is_dir && !Tree(root, path, output, depth + 1)) return false;
+    }
+}
+auto RemoveTree(const std::string& root) -> bool {
+    std::vector<TreeItem> entries; if (!Tree(root, "", entries)) return false;
+    for (const auto& item : std::views::reverse(entries)) {
+        const auto path = root + '/' + item.path;
+        if (item.directory ? rmdir(path.c_str()) : unlink(path.c_str())) return false;
+    }
+    return !rmdir(root.c_str());
+}
+auto HashFile(const std::string& path) -> std::string {
+    auto file = Open(path, "rb"); if (!file) return {};
+    auto buffer = std::make_unique<std::array<u8, Chunk>>(); Sha256Context context{}; sha256ContextCreate(&context);
+    while (const auto count = std::fread(buffer->data(), 1, buffer->size(), file.get())) sha256ContextUpdate(&context, buffer->data(), count);
+    if (std::ferror(file.get())) return {};
+    std::array<u8, 32> digest{}; sha256ContextGetHash(&context, digest.data());
+    std::string result; for (const auto byte : digest) { char hex[3]; std::snprintf(hex, sizeof(hex), "%02X", byte); result += hex; } return result;
+}
+struct Handle {
+    std::string root, target, temporary, mount, kind;
+    std::string operation_id, target_fingerprint;
+    File file{nullptr, &std::fclose};
+    std::vector<ui::menu::game::NspEntry> exports;
+    FsSaveDataInfo save{};
+    u64 size{}, written{};
+    struct Expected { u64 size{}, written{}; std::string sha; };
+    std::map<std::string, Expected> expected;
+    std::vector<std::string> directories;
+    bool committed{}, live_started{};
+    ~Handle() {
+        file.reset(); if (!mount.empty()) fsdevUnmountDevice(mount.c_str());
+        if (!committed && !temporary.empty() && kind == "upload") unlink(temporary.c_str());
+        if (!root.empty() && kind == "restore" && !live_started && root.starts_with("sdmc:/switch/SwitchDesk/staging/")) RemoveTree(root);
+    }
+};
+struct Json {
+    std::unique_ptr<yyjson_mut_doc, decltype(&yyjson_mut_doc_free)> doc{yyjson_mut_doc_new(nullptr), &yyjson_mut_doc_free};
+    auto Obj() -> yyjson_mut_val* { return yyjson_mut_obj(doc.get()); }
+    auto Arr() -> yyjson_mut_val* { return yyjson_mut_arr(doc.get()); }
+    void Add(yyjson_mut_val* obj, const char* key, yyjson_mut_val* value) { yyjson_mut_obj_add(obj, yyjson_mut_strcpy(doc.get(), key), value); }
+    void Str(yyjson_mut_val* obj, const char* key, const std::string& value) { Add(obj, key, yyjson_mut_strcpy(doc.get(), value.c_str())); }
+    void Num(yyjson_mut_val* obj, const char* key, u64 value) { Add(obj, key, yyjson_mut_uint(doc.get(), value)); }
+    void Bool(yyjson_mut_val* obj, const char* key, bool value) { Add(obj, key, yyjson_mut_bool(doc.get(), value)); }
+    void Push(yyjson_mut_val* arr, yyjson_mut_val* value) { yyjson_mut_arr_append(arr, value); }
+    auto Encode(yyjson_mut_val* value) -> std::string { yyjson_mut_doc_set_root(doc.get(), value); size_t size{}; auto data = yyjson_mut_write(doc.get(), 0, &size); if (!data) return {}; std::string output(data, size); std::free(data); return output; }
+};
+auto TreeFingerprint(const std::string& root, std::vector<TreeItem> entries) -> std::string {
+    std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) { return a.path < b.path; });
+    Sha256Context context{}; sha256ContextCreate(&context);
+    for (const auto& item : entries) {
+        sha256ContextUpdate(&context, item.path.c_str(), item.path.size() + 1);
+        const u8 type = item.directory ? 1 : 0; sha256ContextUpdate(&context, &type, 1);
+        if (!item.directory) {
+            std::array<u8, 8> length{}; for (unsigned i = 0; i < 8; ++i) length[i] = static_cast<u8>(item.size >> (i * 8));
+            sha256ContextUpdate(&context, length.data(), length.size()); const auto hash = HashFile(root + '/' + item.path); if (hash.empty()) return {};
+            sha256ContextUpdate(&context, hash.data(), hash.size());
+        }
+    }
+    std::array<u8, 32> digest{}; sha256ContextGetHash(&context, digest.data()); std::string result;
+    for (const auto b : digest) { char hex[3]{}; std::snprintf(hex, sizeof(hex), "%02X", b); result += hex; } return result;
+}
+auto CopyFileChecked(const std::string& from, const std::string& to, u64 size) -> bool {
+    auto input = Open(from, "rb"), output = Open(to, "wb"); if (!input || !output) return false;
+    auto buffer = std::make_unique<std::array<u8, Chunk>>(); u64 copied{};
+    while (const auto count = std::fread(buffer->data(), 1, buffer->size(), input.get())) {
+        if (count > size - copied || std::fwrite(buffer->data(), 1, count, output.get()) != count) return false;
+        copied += count;
+    }
+    if (copied != size || std::ferror(input.get()) || std::fflush(output.get()) || fsync(fileno(output.get()))) return false;
+    output.reset(); const auto original = HashFile(from); return !original.empty() && SameDigest(original, HashFile(to));
+}
+auto OperationBase(const std::string& id) -> std::string { return "sdmc:/switch/SwitchDesk/operations/" + id; }
+auto RecordOperation(const std::string& id, const std::string& phase, const FsSaveDataInfo& save,
+    const std::string& recovery, const std::string& fingerprint) -> bool {
+    if (!ValidOperationId(id) || !Mkdirs("sdmc:/switch/SwitchDesk/operations")) return false;
+    Json json; const auto row = json.Obj(); json.Str(row, "operationId", id); json.Str(row, "state", phase);
+    json.Str(row, "deviceId", DeviceId()); json.Str(row, "environment", Environment()); json.Str(row, "titleId", Hex(save.application_id));
+    json.Str(row, "userId", Uid(save.uid)); json.Str(row, "recovery", recovery); json.Str(row, "targetFingerprint", fingerprint);
+    return PublishOperationRecord(OperationBase(id), phase, json.Encode(row));
+}
+auto String(yyjson_val* object, const char* key) -> std::string { const auto value = yyjson_obj_get(object, key); const auto text = yyjson_get_str(value); return text ? std::string(text, yyjson_get_len(value)) : std::string{}; }
+auto Number(yyjson_val* object, const char* key) -> u64 { return yyjson_get_uint(yyjson_obj_get(object, key)); }
+
+struct Server;
+struct RemoteSource final : yati::source::Base {
+    Server& server; u64 size;
+    RemoteSource(Server& owner, u64 length) : server(owner), size(length) { }
+    Result Read(void* buffer, s64 offset, s64 count, u64* read) override;
+};
+struct Server {
+    ui::ProgressBox* progress;
+    usb::UsbDs usb{UINT64_MAX};
+    std::map<std::string, std::unique_ptr<Handle>> handles;
+    std::map<std::string, FsSaveDataInfo> saves;
+    u64 handle_id{};
+    std::string error_code, error_message;
+    bool released{}, cancelled{};
+    explicit Server(ui::ProgressBox* box) : progress(box) { }
+    ~Server() {
+        const std::lock_guard lock(request_mutex);
+        handles.clear();
+        transfer_open = false;
+    }
+    Result Fail(const std::string& code, const std::string& message) { error_code = code; error_message = message; return Failure; }
+    Result Write(Kind kind, std::span<const u8> bytes) {
+        auto header = Encode({kind, bytes.size()}); R_TRY(usb.TransferAll(false, header.data(), header.size(), 10000000000ULL));
+        if (!bytes.empty()) R_TRY(usb.TransferAll(false, const_cast<u8*>(bytes.data()), bytes.size(), 10000000000ULL)); return 0;
+    }
+    Result WriteJson(Kind kind, Json& json, yyjson_mut_val* value) { const auto text = json.Encode(value); R_UNLESS(!text.empty(), Failure); return Write(kind, {reinterpret_cast<const u8*>(text.data()), text.size()}); }
+    Result Read(Kind& kind, std::vector<u8>& bytes, u64 timeout = UINT64_MAX) {
+        std::array<u8, 16> header{}; R_TRY(usb.TransferAll(true, header.data(), header.size(), timeout)); Header parsed{};
+        R_UNLESS(Decode(header, parsed), Failure); kind = parsed.kind; bytes.resize(parsed.size);
+        if (!bytes.empty()) R_TRY(usb.TransferAll(true, bytes.data(), bytes.size(), 10000000000ULL));
+        if (kind == Kind::Cancel) { cancelled = true; return Failure; } return 0;
+    }
+    Result Run();
+    Result Dispatch(const std::string& method, yyjson_val* args, Json& json, yyjson_mut_val*& result, std::vector<u8>& binary);
+    Result ListTitles(Json& json, yyjson_mut_val*& result);
+    Result ListSaves(Json& json, yyjson_mut_val*& result);
+    Result Inspect(RemoteSource& source, const std::string& name, Json& json, yyjson_mut_val*& result);
+    Result Mount(Handle& handle, const FsSaveDataInfo& save);
+    auto NewHandle(std::unique_ptr<Handle> value) -> std::string { const auto key = std::to_string(++handle_id); handles.emplace(key, std::move(value)); return key; }
+};
+Result RemoteSource::Read(void* buffer, s64 offset, s64 count, u64* read) {
+    *read = 0; R_UNLESS(offset >= 0 && count >= 0 && static_cast<u64>(offset) <= size && static_cast<u64>(count) <= size - offset, Failure);
+    while (*read < static_cast<u64>(count)) {
+        R_TRY(server.progress->ShouldExitResult()); const auto length = std::min<u64>(Chunk, count - *read);
+        Json json; const auto request = json.Obj(); json.Num(request, "offset", offset + *read); json.Num(request, "length", length);
+        const auto total = progress_total.load();
+        if (total > 0) { const auto update = json.Obj(); json.Num(update, "completed", std::max(0LL, progress_done.load())); json.Num(update, "total", total); json.Str(update, "stage", "安装内容"); R_TRY(server.WriteJson(Kind::Progress, json, update)); }
+        R_TRY(server.WriteJson(Kind::ReadAt, json, request)); Kind kind{}; std::vector<u8> bytes; R_TRY(server.Read(kind, bytes, 10000000000ULL));
+        R_UNLESS(kind == Kind::Binary && bytes.size() == length, Failure); std::memcpy(static_cast<u8*>(buffer) + *read, bytes.data(), bytes.size()); *read += bytes.size();
+    }
+    return 0;
+}
+Result Server::Mount(Handle& handle, const FsSaveDataInfo& save) {
+    for (const auto& [id, item] : handles) if (!item->mount.empty()) return Fail("SaveBusy", "另一个存档正在使用，请结束当前操作");
+    FsSaveDataAttribute attr{}; attr.application_id = save.application_id; attr.uid = save.uid; attr.save_data_type = save.save_data_type;
+    attr.save_data_rank = save.save_data_rank; attr.save_data_index = save.save_data_index;
+    FsFileSystem fs{}; const auto rc = fsOpenSaveDataFileSystem(&fs, static_cast<FsSaveDataSpaceId>(save.save_data_space_id), &attr);
+    if (R_FAILED(rc)) return Fail("SaveBusy", "无法打开存档；请关闭游戏，并在完整应用模式下运行配套程序");
+    // fsdevMountDevice already closes fs on failure.
+    if (fsdevMountDevice("sdksave", fs) < 0) return Fail("SaveMount", "挂载存档失败");
+    handle.mount = "sdksave"; handle.root = "sdksave:/"; handle.save = save; return 0;
+}
+Result Server::ListTitles(Json& json, yyjson_mut_val*& result) {
+    result = json.Arr();
+    return title::ForEachApplicationRecord([&](std::span<const NsApplicationRecord> records) {
+        for (const auto& record : records) {
+            const auto row = json.Obj(); const auto info = title::Get(record.application_id);
+            json.Str(row, "titleId", Hex(record.application_id)); json.Str(row, "name", info ? info->lang.name : Hex(record.application_id));
+            json.Str(row, "publisher", info ? info->lang.author : "");
+            auto control = std::make_unique<NsApplicationControlData>(); u64 actual{};
+            json.Str(row, "displayVersion", R_SUCCEEDED(nsGetApplicationControlData(NsApplicationControlSource_CacheOnly, record.application_id, control.get(), sizeof(*control), &actual)) ? control->nacp.display_version : "");
+            title::MetaEntries entries;
+            const auto meta_result = title::GetMetaEntries(record.application_id, entries);
+            const auto components = json.Arr(); bool has_base{}, unreadable = R_FAILED(meta_result);
+            for (const auto& entry : entries) {
+                if (entry.meta_type < NcmContentMetaType_Application || entry.meta_type > NcmContentMetaType_DataPatch) continue;
+                ui::menu::game::ContentInfoEntry content{}; if (R_FAILED(ui::menu::game::BuildContentEntry(entry, content))) { unreadable = true; continue; }
+                if (entry.meta_type == NcmContentMetaType_Application) has_base = true;
+                u64 size{}; std::set<std::string> seen;
+                for (const auto& item : content.content_infos) { const auto id = std::string(reinterpret_cast<const char*>(&item.content_id), sizeof(item.content_id)); if (!seen.insert(id).second) continue; u64 length{}; ncmContentInfoSizeToU64(&item, &length); size += length; }
+                const auto component = json.Obj(); json.Str(component, "titleId", Hex(entry.application_id)); json.Str(component, "kind", MetaKind(entry.meta_type));
+                json.Num(component, "version", entry.version); json.Str(component, "storage", Storage(entry.storageID)); json.Num(component, "size", size); json.Push(components, component);
+            }
+            json.Str(row, "state", has_base ? "已安装" : yyjson_mut_arr_size(components) ? "仅更新/DLC · 缺少本体" : unreadable ? "内容信息不可读取" : "已归档/卡带未插入"); json.Add(row, "components", components); json.Push(result, row);
+        }
+    });
+}
+Result Server::ListSaves(Json& json, yyjson_mut_val*& result) {
+    result = json.Arr(); saves.clear(); FsSaveDataInfoReader reader{};
+    { const auto rc = fsOpenSaveDataInfoReader(&reader, FsSaveDataSpaceId_User); if (R_FAILED(rc)) return Fail("SaveListOpen", "无法枚举存档列表（固件或系统环境可能不支持），Result=" + Hex(rc)); }
+    ON_SCOPE_EXIT(fsSaveDataInfoReaderClose(&reader)); std::array<FsSaveDataInfo, 32> entries{}; s64 count{};
+    do {
+        { const auto rc = fsSaveDataInfoReaderRead(&reader, entries.data(), entries.size(), &count); if (R_FAILED(rc)) return Fail("SaveListRead", "读取存档列表中断，Result=" + Hex(rc)); }
+        for (s64 i = 0; i < count; ++i) {
+            const auto& save = entries[i]; if (save.save_data_type != FsSaveDataType_Account && save.save_data_type != FsSaveDataType_Device) continue;
+            const auto key = Hex(save.save_data_id) + '-' + std::to_string(save.save_data_type); saves[key] = save;
+            const auto row = json.Obj(); const auto info = title::Get(save.application_id); const auto user = Uid(save.uid); std::string user_name = save.save_data_type == FsSaveDataType_Device ? "设备共享" : "未知用户";
+            for (const auto& profile : App::GetAccountList()) if (Uid(profile.uid) == user) { user_name = profile.nickname; break; }
+            json.Str(row, "key", key); json.Str(row, "titleId", Hex(save.application_id)); json.Str(row, "gameName", info ? info->lang.name : Hex(save.application_id));
+            json.Str(row, "userId", user); json.Str(row, "userName", user_name); json.Str(row, "type", save.save_data_type == FsSaveDataType_Account ? "Account" : "Device");
+            json.Num(row, "size", save.size); json.Str(row, "environment", Environment()); json.Push(result, row);
+        }
+    } while (count > 0); return 0;
+}
+Result Server::Inspect(RemoteSource& source, const std::string& name, Json& json, yyjson_mut_val*& result) {
+    if (!Mkdirs("sdmc:/switch/SwitchDesk")) return Fail("AppDirectory", "无法创建 SwitchDesk 自己的临时目录");
+    std::unique_ptr<yati::container::Base> container;
+    auto lower = name; std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (lower.ends_with(".nsp") || lower.ends_with(".nsz")) container = std::make_unique<yati::container::Nsp>(&source);
+    if (lower.ends_with(".xci") || lower.ends_with(".xcz")) container = std::make_unique<yati::container::Xci>(&source);
+    if (!container) return Fail("PackageType", "仅支持 NSP/XCI/NSZ/XCZ");
+    yati::container::Collections collections; { const auto rc = container->GetCollections(collections); if (R_FAILED(rc)) return Fail("PackageCollections", "解析安装包容器失败（" + name + "），Result=" + Hex(rc)); }
+    keys::Keys keys{}; { const auto rc = keys::parse_keys(keys, true); if (R_FAILED(rc)) return Fail("PackageKeys", "读取主机密钥失败；请检查 SD:/switch/prod.keys 是否与固件匹配，Result=" + Hex(rc)); }
+    u64 required{};
+    const auto components = json.Arr(); std::string app_id;
+    for (const auto& item : collections) {
+        if (item.offset < 0 || item.size < 0 || static_cast<u64>(item.offset) > source.size || static_cast<u64>(item.size) > source.size - item.offset) return Fail("PackageBounds", "安装包内容边界错误");
+        if (!item.name.ends_with(".nca") && !item.name.ends_with(".ncz")) continue;
+        if (item.size < sizeof(nca::Header)) return Fail("PackageHeader", "NCA 头不完整");
+        std::array<u8, sizeof(nca::Header)> data{}; u64 read{}; { const auto rc = source.Read(data.data(), item.offset, data.size(), &read); if (R_FAILED(rc)) return Fail("PackageRead", "读取安装包失败（文件可能被移动或读取中断），Result=" + Hex(rc)); }
+        nca::Header header{};
+        { const auto rc = nca::DecryptHeader(data.data(), keys, header); if (R_FAILED(rc)) return Fail("PackageHeader", "NCA 头解密失败（包损坏或密钥不匹配），Result=" + Hex(rc)); }
+        if (header.size < sizeof(nca::Header) || header.size > static_cast<u64>(INT64_MAX) - required) return Fail("PackageSize", "安装包大小无效");
+        required += header.size;
+        if (item.name.ends_with(".cnmt.nca")) {
+            if (item.size > 64 * 1024 * 1024) return Fail("MetadataSize", "内容清单过大");
+            if (header.size != static_cast<u64>(item.size)) return Fail("MetadataSize", "内容清单 NCA 长度与包目录不符");
+            ncm::PackagedContentMeta meta{}; std::vector<u8> extended; std::vector<NcmPackagedContentInfo> infos; std::string parse_stage, parse_detail;
+            // Read metadata in userspace; keep the source header unchanged for fallback.
+            auto rc = nca::ParseCnmtFromSource(source, static_cast<u64>(item.offset), header, keys, meta, extended, infos, parse_stage, &parse_detail);
+            if (R_FAILED(rc)) {
+                // 回退：fsp-srv 按程序 ID 解析（上游原始路径，某些环境下有效）。
+                const auto stage = "sdmc:/switch/SwitchDesk/inspect.nca";
+                ON_SCOPE_EXIT(unlink(stage));
+                auto file = Open(stage, "wb"); if (!file) return Fail("StageSpace", "无法创建内容清单临时文件");
+                auto buffer = std::make_unique<std::array<u8, Chunk>>();
+                for (u64 offset = 0; offset < static_cast<u64>(item.size);) { const auto count = std::min<u64>(Chunk, item.size - offset); { const auto rc2 = source.Read(buffer->data(), item.offset + offset, count, &read); if (R_FAILED(rc2)) return Fail("PackageRead", "读取安装包失败（文件可能被移动或读取中断），Result=" + Hex(rc2)); } if (std::fwrite(buffer->data(), 1, count, file.get()) != count) return Fail("StageWrite", "内容清单写入失败"); offset += count; }
+                file.reset();
+                { const auto rc2 = nca::ParseCnmt(fs::FsPath("@Sdcard:/switch/SwitchDesk/inspect.nca"), header.program_id, meta, extended, infos); if (R_FAILED(rc2)) return Fail("PackageCnmt", std::string("CNMT 解析失败 · 配套 ") + BuildId + " · " + parse_detail + " · 用户态阶段 " + parse_stage + " Result=" + Hex(rc) + " · fsp-srv 回退 Result=" + Hex(rc2)); }
+            }
+            u64 owner = ncm::GetAppId(meta), required_content{}; u32 required_system = meta.required_sys_version, required_application{};
+            if (meta.meta_type == NcmContentMetaType_Application) {
+                if (extended.size() != sizeof(NcmApplicationMetaExtendedHeader)) return Fail("MetadataHeader", "本体扩展清单长度不兼容");
+                NcmApplicationMetaExtendedHeader ext{}; std::memcpy(&ext, extended.data(), sizeof(ext)); required_system = std::max(required_system, ext.required_system_version); required_application = ext.required_application_version;
+            } else if (meta.meta_type == NcmContentMetaType_Patch) {
+                if (extended.size() != sizeof(NcmPatchMetaExtendedHeader)) return Fail("MetadataHeader", "更新扩展清单长度不兼容");
+                NcmPatchMetaExtendedHeader ext{}; std::memcpy(&ext, extended.data(), sizeof(ext)); owner = ext.application_id; required_system = std::max(required_system, ext.required_system_version);
+            } else if (meta.meta_type == NcmContentMetaType_AddOnContent) {
+                if (extended.size() != sizeof(NcmAddOnContentMetaExtendedHeader) && extended.size() != sizeof(NcmLegacyAddOnContentMetaExtendedHeader)) return Fail("MetadataHeader", "DLC 扩展清单长度不兼容");
+                NcmLegacyAddOnContentMetaExtendedHeader ext{}; std::memcpy(&ext, extended.data(), sizeof(ext)); owner = ext.application_id; required_application = ext.required_application_version;
+            } else if (meta.meta_type == NcmContentMetaType_DataPatch) {
+                if (extended.size() != sizeof(NcmDataPatchMetaExtendedHeader)) return Fail("MetadataHeader", "DLC 更新扩展清单长度不兼容");
+                NcmDataPatchMetaExtendedHeader ext{}; std::memcpy(&ext, extended.data(), sizeof(ext)); owner = ext.application_id; required_application = ext.required_application_version; required_content = ext.data_id;
+            } else return Fail("MetadataType", "不安装系统内容或不支持的组件");
+            const auto component = json.Obj(); json.Str(component, "titleId", Hex(meta.title_id)); json.Str(component, "kind", MetaKind(meta.meta_type)); json.Num(component, "version", meta.title_version);
+            json.Str(component, "applicationId", Hex(owner)); json.Num(component, "requiredSystemVersion", required_system); json.Num(component, "requiredApplicationVersion", required_application);
+            if (required_content) json.Str(component, "requiredContentId", Hex(required_content));
+            json.Str(component, "storage", "Package"); u64 size = item.size;
+            for (const auto& content : infos) { u64 length{}; ncmContentInfoSizeToU64(&content.info, &length); if (length > static_cast<u64>(INT64_MAX) - size) return Fail("MetadataSize", "组件内容大小超过支持范围"); size += length; }
+            json.Num(component, "size", size); json.Push(components, component); if (app_id.empty()) app_id = Hex(owner);
+        }
+    }
+    if (yyjson_mut_arr_size(components) == 0 || required == 0 || required > static_cast<u64>(INT64_MAX) - 1024 * 1024) return Fail("PackageMetadata", "未找到有效的内容清单");
+    result = json.Obj(); json.Str(result, "name", name); json.Str(result, "gameName", name); json.Str(result, "titleId", app_id);
+    json.Num(result, "requiredBytes", required + 1024 * 1024); json.Bool(result, "recognized", true); json.Add(result, "components", components); return 0;
+}
+Result Server::Dispatch(const std::string& method, yyjson_val* args, Json& json, yyjson_mut_val*& result, std::vector<u8>& binary) {
+    result = json.Obj();
+    if (method == "hello") {
+        if (Number(args, "protocol") != Protocol) return Fail("ProtocolMismatch", "协议版本不兼容");
+        ManagementConnection(true);
+        json.Num(result, "protocol", Protocol); json.Str(result, "companion", std::string("SwitchDesk/") + BuildVersion + "+" + BuildId); return 0;
+    }
+    if (method == "device.info") {
+        SetSysFirmwareVersion fw{}; SetSysProductModel model{}; const auto fw_rc = setsysGetFirmwareVersion(&fw); const auto model_rc = setsysGetProductModel(&model);
+        if (R_FAILED(fw_rc) || R_FAILED(model_rc)) return Fail("DeviceInfo", "读取主机固件或型号失败，Result=" + Hex(fw_rc) + " / " + Hex(model_rc));
+        const char* model_name = "Nintendo Switch";
+        if (model == SetSysProductModel_Iowa) model_name = "Nintendo Switch 续航版";
+        if (model == SetSysProductModel_Hoag) model_name = "Nintendo Switch Lite";
+        if (model == SetSysProductModel_Aula) model_name = "Nintendo Switch OLED";
+        u64 ams{}; const auto ams_rc = splGetConfig(static_cast<SplConfigItem>(65000), &ams);
+        const auto version = std::to_string((ams >> 56) & 255) + '.' + std::to_string((ams >> 48) & 255) + '.' + std::to_string((ams >> 40) & 255);
+        UsbDeviceSpeed speed{}; u16 packet{}; usb.GetSpeed(&speed, &packet);
+        json.Str(result, "deviceId", DeviceId()); json.Str(result, "model", model_name); json.Str(result, "firmware", fw.display_version);
+        json.Str(result, "atmosphere", R_SUCCEEDED(ams_rc) ? version : "不可读取"); json.Str(result, "companion", std::string(BuildVersion) + "+" + BuildId + " / Sphaira 1.0.8");
+        json.Str(result, "environment", Environment()); json.Str(result, "usbSpeed", GetUsbDsSpeedStr(speed)); json.Bool(result, "applicationMode", App::IsApplication());
+        const auto caps = json.Arr(); for (const auto cap : {"files", "titles"}) json.Push(caps, yyjson_mut_strcpy(json.doc.get(), cap));
+        if (envHasNextLoad()) json.Push(caps, yyjson_mut_strcpy(json.doc.get(), "dbi.launch.v1"));
+        if (App::IsApplication()) for (const auto cap : {"saves", "install", "inspect", "export", "saves.inspect", "restore.atomic.v1", "operations.status", "package.dependencies.v1", "install.plan.v1", "install.hash-warning.v1", "install.signature-warning.v1", "cheats.write.v1", "cheats.text.v1"}) json.Push(caps, yyjson_mut_strcpy(json.doc.get(), cap));
+        json.Add(result, "capabilities", caps); return 0;
+    }
+    if (method == "device.release") { released = true; return 0; }
+    if (method == "dbi.launch") {
+        if (yyjson_obj_size(args) != 0) return Fail("DbiArguments", "打开 DBI 不接受自定义路径或参数");
+        const auto launch = ScheduleDbi();
+        if (!launch.path) return Fail(launch.code, launch.message);
+        json.Bool(result, "scheduled", true); json.Str(result, "path", launch.path);
+        released = true;
+        return 0;
+    }
+    if (method == "storages.list") {
+        result = json.Arr();
+        for (const auto id : {NcmStorageId_SdCard, NcmStorageId_BuiltInUser}) {
+            s64 total{}, free{}; { const auto rc = nsGetStorageSize(id, &total, &free); if (R_FAILED(rc)) return Fail("StorageSize", "读取存储容量失败，Result=" + Hex(rc)); } const auto row = json.Obj();
+            if (total < 0 || free < 0 || free > total) return Fail("StorageUnknown", "主机未能提供可靠的存储容量");
+            json.Str(row, "id", Storage(id)); json.Str(row, "name", id == NcmStorageId_SdCard ? "SD 卡" : (App::IsEmummc() ? "当前虚拟系统用户分区（emuMMC）" : "当前真实系统用户分区（sysMMC）"));
+            json.Num(row, "totalBytes", total); json.Num(row, "freeBytes", free); json.Push(result, row);
+        } return 0;
+    }
+    if (method == "titles.list") return ListTitles(json, result);
+    if (method == "titles.icon") {
+        const auto id = String(args, "titleId"); if (id.size() != 16 || id.find_first_not_of("0123456789abcdefABCDEF") != id.npos) return Fail("TitleId", "游戏标识无效");
+        auto control = std::make_unique<NsApplicationControlData>(); u64 actual{};
+        { const auto rc = nsGetApplicationControlData(NsApplicationControlSource_Storage, std::strtoull(id.c_str(), nullptr, 16), control.get(), sizeof(*control), &actual); if (R_FAILED(rc)) return Fail("IconData", "读取游戏图标数据失败（该游戏可能未正确安装），Result=" + Hex(rc)); }
+        if (actual <= sizeof(NacpStruct) || actual > sizeof(*control)) return Fail("Icon", "该游戏没有可读取的图标");
+        binary.assign(control->icon, control->icon + actual - sizeof(NacpStruct)); json.Num(result, "binaryLength", binary.size()); return 0;
+    }
+    if (method == "saves.list") { if (!App::IsApplication()) return Fail("ApplicationMode", "存档操作要求完整应用模式");
+    return ListSaves(json, result); }
+    if (method == "saves.inspect") {
+        if (!App::IsApplication()) return Fail("ApplicationMode", "存档检查要求完整应用模式");
+        const auto found = saves.find(String(args, "key")); if (found == saves.end()) return Fail("SaveMissing", "请先刷新存档列表");
+        const auto& save = found->second;
+        if (String(args, "titleId") != Hex(save.application_id) || String(args, "userId") != Uid(save.uid) || String(args, "environment") != Environment()) return Fail("SaveMismatch", "存档用户或环境已变化");
+        Handle live; { const auto rc = Mount(live, save); if (R_FAILED(rc)) return Fail("SaveMount", "挂载存档失败（存档可能损坏或被占用），Result=" + Hex(rc)); } std::vector<TreeItem> tree; if (!Tree(live.root, "", tree)) return Fail("SaveRead", "读取存档文件失败");
+        const auto fingerprint = TreeFingerprint(live.root, tree); if (fingerprint.empty()) return Fail("SaveRead", "存档指纹读取失败"); json.Str(result, "fingerprint", fingerprint);
+        FsSaveDataExtraData extra{}; const auto rc = fsReadSaveDataFileSystemExtraDataBySaveDataSpaceId(&extra, sizeof(extra), static_cast<FsSaveDataSpaceId>(save.save_data_space_id), save.save_data_id);
+        const bool valid_time = R_SUCCEEDED(rc) && extra.timestamp >= 946684800ULL && extra.timestamp < 4102444800ULL;
+        if (valid_time) json.Num(result, "savedAtUnixSeconds", extra.timestamp); else json.Add(result, "savedAtUnixSeconds", yyjson_mut_null(json.doc.get()));
+        json.Str(result, "timeSource", valid_time ? "SaveCommit" : "ObservedOnly"); if (R_SUCCEEDED(rc)) json.Str(result, "commitId", Hex(extra.commit_id));
+        return 0;
+    }
+    if (method == "operations.status") {
+        const auto id = String(args, "operationId"); if (!ValidOperationId(id)) return Fail("OperationId", "操作标识无效");
+        auto file = OpenOperationRecord(OperationBase(id));
+        if (!file) {
+            if (errno != ENOENT) return Fail("OperationLog", "无法读取操作日志");
+            json.Str(result, "state", "unknown"); return 0;
+        }
+        std::array<char, 8192> text{}; const auto count = std::fread(text.data(), 1, text.size(), file.get());
+        if (count == text.size() || std::ferror(file.get())) return Fail("OperationLog", "恢复日志不可读取");
+        auto doc = std::unique_ptr<yyjson_doc, decltype(&yyjson_doc_free)>(yyjson_read(text.data(), count, 0), &yyjson_doc_free);
+        if (!doc) return Fail("OperationLog", "恢复日志损坏，请保留 SD 上的恢复目录");
+        const auto row = yyjson_doc_get_root(doc.get()); if (!EqualFold(String(row, "operationId"), id) || String(row, "deviceId") != DeviceId() || String(row, "environment") != Environment()) return Fail("OperationMismatch", "操作标识、主机或系统环境不匹配");
+        result = yyjson_val_mut_copy(json.doc.get(), row); return 0;
+    }
+    if (method == "fs.list") {
+        const auto path = String(args, "path"); if (!ValidRemote(path)) return Fail("InvalidPath", "路径格式错误");
+        auto dir = std::unique_ptr<DIR, decltype(&closedir)>(opendir(("sdmc:" + path).c_str()), &closedir); if (!dir) return Fail("DirectoryOpen", "无法打开目录");
+        result = json.Arr();
+        for (;;) {
+            errno = 0;
+            const auto entry = readdir(dir.get());
+            if (!entry) {
+                if (errno != 0 && errno != ENOENT) return Fail("DirectoryRead", "未能完整读取 SD 目录");
+                break;
+            }
+            const auto name = std::string(entry->d_name); if (name == "." || name == "..") continue;
+            const auto remote = path == "/" ? '/' + name : path + '/' + name; struct stat info{};
+            if (stat(("sdmc:" + remote).c_str(), &info)) return Fail("DirectoryRead", "未能完整读取目录项：" + remote);
+            const auto row = json.Obj(); json.Str(row, "name", name); json.Str(row, "path", remote); json.Bool(row, "isDirectory", S_ISDIR(info.st_mode)); json.Num(row, "size", info.st_size); json.Push(result, row);
+        } return 0;
+    }
+    if (method == "fs.stat") {
+        const auto path = String(args, "path"); if (!ValidRemote(path)) return Fail("InvalidPath", "路径无效");
+        struct stat info{}; const auto exists = !stat(("sdmc:" + path).c_str(), &info);
+        if (!exists && errno != ENOENT) return Fail("Stat", "无法查询目标路径");
+        json.Bool(result, "exists", exists); json.Bool(result, "isDirectory", exists && S_ISDIR(info.st_mode)); json.Num(result, "size", exists ? info.st_size : 0); return 0;
+    }
+    if (method == "fs.mkdir" || method == "fs.rename" || method == "fs.delete") {
+        const auto path = String(args, "path");
+        // Cheats need exactly two directory shapes and the .cheat file shape; Writable itself stays strict.
+        const auto allowed = method == "fs.mkdir" ? (Writable(path) || IsCheatDirectory(path))
+                           : (MovableOrRemovable(path) || IsCheatFile(path));
+        if (!allowed) return Fail("ProtectedPath", "路径无效或受到系统保护");
+        if (method == "fs.mkdir") { if (mkdir(("sdmc:" + path).c_str(), 0777)) return Fail("CreateDirectory", "创建目录失败");
+        }
+        if (method == "fs.delete") {
+            const auto full = "sdmc:" + path; struct stat info{}; if (stat(full.c_str(), &info)) return Fail("MissingFile", "文件不存在");
+            if (S_ISDIR(info.st_mode) ? rmdir(full.c_str()) : unlink(full.c_str())) return Fail("DeleteFailed", "删除失败；文件夹必须为空");
+        }
+        if (method == "fs.rename") {
+            const auto target = String(args, "target");
+            const auto targetAllowed = (MovableOrRemovable(path) && MovableOrRemovable(target)) || (IsCheatFile(path) && IsCheatFile(target));
+            if (!targetAllowed) return Fail("ProtectedPath", "目标路径受到保护");
+            struct stat info{}; if (!stat(("sdmc:" + target).c_str(), &info)) return Fail("Exists", "目标名称已存在");
+            if (rename(("sdmc:" + path).c_str(), ("sdmc:" + target).c_str())) return Fail("RenameFailed", "重命名失败");
+        } return 0;
+    }
+    if (method == "fs.read.open" || method == "fs.write.open") {
+        const auto path = String(args, "path"); if (!ValidRemote(path)) return Fail("InvalidPath", "路径格式错误");
+        auto handle = std::make_unique<Handle>(); handle->target = "sdmc:" + path;
+        if (method == "fs.read.open") {
+            handle->file = Open(handle->target, "rb"); struct stat info{};
+            if (!handle->file || fstat(fileno(handle->file.get()), &info) || !S_ISREG(info.st_mode)) return Fail("ReadOpen", "无法打开文件");
+            handle->size = info.st_size; handle->kind = "file";
+        } else {
+            if (!Writable(path) && !IsCheatFile(path)) return Fail("ProtectedPath", "该路径受到系统保护");
+            struct stat info{}; if (!stat(handle->target.c_str(), &info)) return Fail("Exists", "目标文件已存在");
+            handle->size = Number(args, "size"); s64 total{}, free{}; { const auto rc = nsGetStorageSize(NcmStorageId_SdCard, &total, &free); if (R_FAILED(rc)) return Fail("StorageSize", "读取 SD 卡容量失败，Result=" + Hex(rc)); }
+            if (free < 0 || handle->size > static_cast<u64>(free) || handle->size > INT64_MAX) return Fail("NoSpace", "SD 卡可用空间不足或不可读取");
+            const auto temporary = handle->target + ".sdk-" + Hex(randomGet64()) + ".partial";
+            const auto fd = open(temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0666); if (fd < 0) return Fail("WriteOpen", "无法创建临时文件");
+            handle->temporary = temporary; handle->kind = "upload";
+            handle->file.reset(fdopen(fd, "wb")); if (!handle->file) { close(fd); return Fail("WriteOpen", "打开文件失败"); }
+            if (ftruncate(fd, handle->size)) return Fail("FileSystemLimit", "无法预分配文件；请检查容量及 FAT32 单文件大小限制");
+        }
+        json.Num(result, "size", handle->size); json.Str(result, "handle", NewHandle(std::move(handle))); return 0;
+    }
+    if (method == "saves.read.open" || method == "saves.restore.begin") {
+        if (!App::IsApplication()) return Fail("ApplicationMode", "请关闭游戏并使用完整应用模式运行配套程序");
+        const auto key = String(args, "key"); const auto it = saves.find(key); if (it == saves.end()) return Fail("SaveMissing", "存档记录已失效，请刷新列表");
+        auto handle = std::make_unique<Handle>(); handle->save = it->second;
+        if (method == "saves.read.open") {
+            const auto& save = it->second;
+            if (yyjson_obj_get(args, "titleId") && (String(args, "titleId") != Hex(save.application_id) ||
+                String(args, "userId") != Uid(save.uid) || String(args, "type") != (save.save_data_type == FsSaveDataType_Account ? "Account" : "Device")))
+                return Fail("SaveMismatch", "存档身份与所选游戏或用户不一致，请刷新列表");
+            { const auto rc = Mount(*handle, save); if (R_FAILED(rc)) return Fail("SaveMount", "挂载存档失败（存档可能损坏或被占用），Result=" + Hex(rc)); } handle->kind = "save";
+        }
+        else {
+            const auto meta = yyjson_obj_get(args, "manifest"); const auto& save = it->second;
+            const auto foreign = yyjson_is_bool(yyjson_obj_get(args, "foreignSource")) && yyjson_get_bool(yyjson_obj_get(args, "foreignSource"));
+            const auto identity_ok = String(meta, "titleId") == Hex(save.application_id) && String(meta, "userId") == Uid(save.uid) &&
+                String(meta, "saveType") == (save.save_data_type == FsSaveDataType_Account ? "Account" : "Device");
+            if (!identity_ok) return Fail("SaveMismatch", "快照与目标游戏或用户不匹配");
+            if (!foreign && (String(meta, "deviceId") != DeviceId() || String(meta, "environment") != Environment()))
+                return Fail("SaveMismatch", "快照来自其他主机或系统环境；跨系统迁移请使用带恢复保护的迁移入口");
+            if (foreign && String(args, "expectedFingerprint").empty())
+                return Fail("ForeignSource", "跨系统迁移必须先读取目标存档指纹（恢复保护），拒绝盲写");
+            const auto files = yyjson_obj_get(meta, "files"); if (!yyjson_is_arr(files) || yyjson_arr_size(files) > 100000) return Fail("Manifest", "存档清单无效");
+            size_t index{}, max{}; yyjson_val* item{}; u64 required{};
+            yyjson_arr_foreach(files, index, max, item) {
+                const auto path = String(item, "path"); const auto sha = String(item, "sha256"); const auto length = Number(item, "size");
+                if (!ValidRelative(path) || sha.size() != 64 || length > INT64_MAX || required > UINT64_MAX - length || handle->expected.contains(path)) return Fail("Manifest", "存档文件清单无效");
+                handle->expected.emplace(path, Handle::Expected{length, 0, sha}); required += length;
+            }
+            const auto dirs = yyjson_obj_get(meta, "directories");
+            if (!yyjson_is_arr(dirs) || yyjson_arr_size(dirs) > 100000) return Fail("Manifest", "存档目录清单无效或过大");
+            yyjson_arr_foreach(dirs, index, max, item) { const auto text = yyjson_get_str(item); if (!text || !ValidRelative(text)) return Fail("Manifest", "存档目录无效"); handle->directories.emplace_back(text); }
+            FsSaveDataExtraData extra{}; { const auto rc = fsReadSaveDataFileSystemExtraDataBySaveDataSpaceId(&extra, sizeof(extra), static_cast<FsSaveDataSpaceId>(save.save_data_space_id), save.save_data_id); if (R_FAILED(rc)) return Fail("SaveExtra", "读取存档元数据失败，Result=" + Hex(rc)); }
+            Handle current; { const auto rc = Mount(current, save); if (R_FAILED(rc)) return Fail("SaveMount", "挂载目标存档失败，Result=" + Hex(rc)); } std::vector<TreeItem> existing;
+            if (!Tree(current.root, "", existing)) return Fail("SaveRead", "读取目标存档失败");
+            u64 old_bytes{};
+            for (const auto& entry : existing) if (!entry.directory) { if (entry.size > UINT64_MAX - old_bytes) return Fail("SaveCapacity", "目标存档大小溢出"); old_bytes += entry.size; }
+            if (extra.data_size <= 0 || extra.journal_size <= 0 || !RestoreFits(extra.data_size, extra.journal_size, old_bytes, required, existing.size() + handle->expected.size() + handle->directories.size()))
+                return Fail("SaveJournalCapacity", "存档数据或日志空间不足以完成一次提交；未修改目标，不使用逐文件提交");
+            handle->target_fingerprint = TreeFingerprint(current.root, existing);
+            if (handle->target_fingerprint.empty()) return Fail("SaveRead", "目标存档校验失败");
+            const auto wanted = String(args, "expectedFingerprint");
+            if (!wanted.empty() && !SameDigest(wanted, handle->target_fingerprint)) return Fail("TargetChanged", "目标存档已变化，请重新比较");
+            handle->operation_id = String(args, "operationId"); if (handle->operation_id.empty()) handle->operation_id = Hex(randomGet64()) + Hex(randomGet64());
+            if (!ValidOperationId(handle->operation_id)) return Fail("OperationId", "操作标识无效");
+            if (OpenOperationRecord(OperationBase(handle->operation_id))) return Fail("OperationExists", "此操作已有记录，请先查询实际状态，不能重复覆盖");
+            if (errno != ENOENT) return Fail("OperationLog", "无法检查已有操作记录");
+            s64 total{}, free{}; { const auto rc = nsGetStorageSize(NcmStorageId_SdCard, &total, &free); if (R_FAILED(rc)) return Fail("StorageSize", "读取 SD 卡容量失败（暂存恢复文件前检查），Result=" + Hex(rc)); } if (free < 0 || required > static_cast<u64>(free)) return Fail("NoSpace", "SD 卡没有可靠的可用空间暂存恢复文件");
+            const auto stage_parent = std::string("sdmc:/switch/SwitchDesk/staging");
+            const auto stage = stage_parent + '/' + Hex(randomGet64());
+            if (!Mkdirs(stage_parent) || mkdir(stage.c_str(), 0777)) return Fail("StageCreate", "创建恢复暂存目录失败");
+            handle->root = stage; handle->kind = "restore";
+            if (!RecordOperation(handle->operation_id, "staging", save, "", handle->target_fingerprint)) return Fail("OperationLog", "无法持久保存操作日志，未修改存档");
+            json.Str(result, "operationId", handle->operation_id);
+        }
+        json.Str(result, "handle", NewHandle(std::move(handle))); return 0;
+    }
+    if (method == "titles.export.open") {
+        if (!App::IsApplication()) return Fail("ApplicationMode", "游戏导出要求完整应用模式");
+        const auto wanted = String(args, "titleId"); const auto version = Number(args, "version"); const auto storage = String(args, "storage");
+        auto handle = std::make_unique<Handle>(); handle->kind = "export";
+        Result build_rc = Failure;
+        bool found{};
+        const auto rc = title::ForEachApplicationRecord([&](std::span<const NsApplicationRecord> records) {
+            for (const auto& record : records) {
+                if (found) break;
+                title::MetaEntries entries; title::GetMetaEntries(record.application_id, entries);
+                for (const auto& entry : entries) if (Hex(entry.application_id) == wanted && entry.version == version && storage == Storage(entry.storageID)) {
+                    ui::menu::game::Entry game{}; game.app_id = record.application_id; const auto info = title::Get(record.application_id); if (info) game.lang = info->lang;
+                    found = true;
+                    build_rc = ui::menu::game::BuildNspEntries(game, title::MetaEntries{entry}, handle->exports); break;
+                }
+            }
+        });
+        if (R_FAILED(rc) || R_FAILED(build_rc) || handle->exports.size() != 1) return Fail("ExportUnavailable", "无法打包该组件；请检查主机内容、权限及内容解析所需密钥");
+        if (handle->exports.front().nsp_size <= 0) return Fail("ExportSize", "导出内容大小无效");
+        handle->size = handle->exports.front().nsp_size; json.Num(result, "size", handle->size); json.Str(result, "handle", NewHandle(std::move(handle))); return 0;
+    }
+    if (method == "package.inspect" || method == "titles.install" || method == "titles.install.plan") {
+        if (!App::IsApplication()) return Fail("ApplicationMode", "游戏包解析与安装要求完整应用模式");
+        const auto name = String(args, "name"); if (name.empty() || name.size() > 255 || name.find_first_of("/\\:") != name.npos) return Fail("InvalidName", "安装包名称无效");
+        const auto source_size = Number(args, "size"); if (source_size == 0 || source_size > INT64_MAX) return Fail("PackageSize", "安装包大小无效");
+        RemoteSource source(*this, source_size); progress_done = 0; progress_total = 0;
+        if (method == "package.inspect") return Inspect(source, name, json, result);
+        if (!App::IsApplication()) return Fail("ApplicationMode", "安装要求完整应用模式");
+        const auto policy_value = yyjson_obj_get(args, "ncaHashPolicy");
+        if (policy_value && !yyjson_is_str(policy_value)) return Fail("InstallHashPolicy", "NCA 摘要策略必须为 strict 或 warn");
+        const auto hash_policy = ParseNcaHashPolicy(policy_value ? std::optional<std::string_view>(std::string_view(yyjson_get_str(policy_value), yyjson_get_len(policy_value))) : std::nullopt);
+        if (!hash_policy) return Fail("InstallHashPolicy", "不支持此 NCA 摘要策略；请使用 strict 或 warn");
+        if (method == "titles.install.plan" && *hash_policy != NcaHashPolicy::Strict)
+            return Fail("InstallHashPolicy", "管理安装计划必须使用 strict 摘要策略");
+        const auto signature_value = yyjson_obj_get(args, "ncaSignaturePolicy");
+        if (signature_value && !yyjson_is_str(signature_value)) return Fail("InstallSignaturePolicy", "NCA 签名策略必须为 strict 或 warn");
+        const auto signature_policy = ParseNcaSignaturePolicy(signature_value ? std::optional<std::string_view>(std::string_view(yyjson_get_str(signature_value), yyjson_get_len(signature_value))) : std::nullopt);
+        if (!signature_policy) return Fail("InstallSignaturePolicy", "不支持此 NCA 签名策略；请使用 strict 或 warn");
+        if (method == "titles.install.plan" && *signature_policy != NcaSignaturePolicy::Strict)
+            return Fail("InstallSignaturePolicy", "管理安装计划必须使用 strict 签名策略");
+        const auto storage = String(args, "storage"); if (storage != "SdCard" && storage != "BuiltInUser") return Fail("Storage", "安装目标无效");
+        Json inspection; yyjson_mut_val* package{}; { const auto rc = Inspect(source, name, inspection, package); if (R_FAILED(rc)) { if (!error_code.empty() || !error_message.empty()) return rc; return Fail("PackageInspect", "解析安装包失败，Result=" + Hex(rc)); } }
+        const auto needed = yyjson_mut_get_uint(yyjson_mut_obj_get(package, "requiredBytes")); s64 total{}, free{};
+        { const auto rc = nsGetStorageSize(storage == "SdCard" ? NcmStorageId_SdCard : NcmStorageId_BuiltInUser, &total, &free); if (R_FAILED(rc)) return Fail("StorageSize", "读取目标存储容量失败，Result=" + Hex(rc)); }
+        if (free < 0 || needed > static_cast<u64>(free)) return Fail("NoSpace", "目标存储空间不足或容量不可读取");
+        yati::ConfigOverride config{}; config.sd_card_install = storage == "SdCard"; config.skip_nca_hash_verify = false;
+        config.skip_rsa_header_fixed_key_verify = false; config.skip_rsa_npdm_fixed_key_verify = false;
+        config.allow_nca_hash_mismatch = *hash_policy == NcaHashPolicy::Warn;
+        config.allow_nca_signature_mismatch = *signature_policy == NcaSignaturePolicy::Warn;
+        std::vector<NcaHashWarning> hash_warnings;
+        std::vector<NcaSignatureWarning> signature_warnings;
+        Mutex warning_mutex{};
+        config.nca_hash_warning = [&](const NcaHashWarning& warning) -> Result {
+            mutexLock(&warning_mutex); ON_SCOPE_EXIT(mutexUnlock(&warning_mutex));
+            if (hash_warnings.size() + signature_warnings.size() >= 256) return Fail("InstallWarningsLimit", "安装包包含过多校验警告，已停止当前组件");
+            hash_warnings.push_back(warning); return 0;
+        };
+        config.nca_signature_warning = [&](const NcaSignatureWarning& warning) -> Result {
+            mutexLock(&warning_mutex); ON_SCOPE_EXIT(mutexUnlock(&warning_mutex));
+            if (hash_warnings.size() + signature_warnings.size() >= 256) return Fail("InstallWarningsLimit", "安装包包含过多校验警告，已停止当前组件");
+            signature_warnings.push_back(warning); return 0;
+        };
+        config.lower_system_version = false; config.lower_master_key = false; config.convert_to_standard_crypto = false;
+        config.convert_to_common_ticket = false;
+        const bool managed = method == "titles.install.plan";
+        FsSaveDataInfo operation_save{}; std::string operation_id;
+        if (managed) {
+            if (String(args, "expectedDeviceId") != DeviceId() || String(args, "expectedEnvironment") != Environment()) return Fail("DeviceChanged", "目标主机或系统环境已变化");
+            const auto expected = yyjson_obj_get(args, "expected"); const auto components = yyjson_mut_obj_get(package, "components");
+            if (yyjson_mut_arr_size(components) != 1) return Fail("MixedPackage", "管理更新不接受混合组件包");
+            const auto component = yyjson_mut_arr_get(components, 0); const auto id = String(expected, "componentId"); const auto app = String(expected, "applicationId");
+            const auto kind = String(expected, "kind"); const auto version = Number(expected, "version");
+            if (id.size() != 16 || app.size() != 16 || id.find_first_not_of("0123456789abcdefABCDEF") != id.npos || app.find_first_not_of("0123456789abcdefABCDEF") != app.npos ||
+                kind == "Base" || (kind != "Update" && kind != "DLC" && kind != "DataPatch") || version > UINT32_MAX || Number(expected, "size") != source.size || !SameDigest(String(expected, "sha256"), String(expected, "sha256"))) return Fail("InstallPlan", "安装计划字段无效");
+            const auto text_equals = [&](const char* field, const std::string& wanted) { const auto text = yyjson_mut_get_str(yyjson_mut_obj_get(component, field)); return text && wanted == text; };
+            auto normalized_id = Hex(std::strtoull(id.c_str(), nullptr, 16)), normalized_app = Hex(std::strtoull(app.c_str(), nullptr, 16));
+            if (!text_equals("titleId", normalized_id) || !text_equals("applicationId", normalized_app) || !text_equals("kind", kind) || yyjson_mut_get_uint(yyjson_mut_obj_get(component, "version")) != version) return Fail("PackageMismatch", "真实安装内容与所选索引不一致");
+            SetSysFirmwareVersion firmware{}; { const auto rc2 = setsysGetFirmwareVersion(&firmware); if (R_FAILED(rc2)) return Fail("FirmwareRead", "读取主机固件版本失败，Result=" + Hex(rc2)); }
+            const auto system_version = static_cast<u32>(firmware.major) << 26 | static_cast<u32>(firmware.minor) << 20 | static_cast<u32>(firmware.micro) << 16;
+            if (yyjson_mut_get_uint(yyjson_mut_obj_get(component, "requiredSystemVersion")) > system_version) return Fail("SystemVersion", "内容要求更高的系统版本，未自动升级主机");
+            Json inventory; yyjson_mut_val* games{}; { const auto rc2 = ListTitles(inventory, games); if (R_FAILED(rc2)) return Fail("TitleList", "读取主机游戏列表失败，Result=" + Hex(rc2)); } yyjson_mut_val* installed_components{};
+            size_t index{}, maximum{}; yyjson_mut_val* row{};
+            yyjson_mut_arr_foreach(games, index, maximum, row) { const auto title_id = yyjson_mut_get_str(yyjson_mut_obj_get(row, "titleId")); if (title_id && normalized_app == title_id) installed_components = yyjson_mut_obj_get(row, "components"); }
+            const auto before = yyjson_obj_get(args, "before"); if (!installed_components || !yyjson_is_arr(before) || yyjson_arr_size(before) != yyjson_mut_arr_size(installed_components)) return Fail("InventoryChanged", "游戏内容清单已变化或缺少本体");
+            bool has_base{}, has_required_dlc = kind != "DataPatch"; u64 app_version{};
+            const auto required_dlc = yyjson_mut_get_str(yyjson_mut_obj_get(component, "requiredContentId"));
+            yyjson_mut_arr_foreach(installed_components, index, maximum, row) {
+                const auto installed_kind = yyjson_mut_get_str(yyjson_mut_obj_get(row, "kind")); const auto installed_id = yyjson_mut_get_str(yyjson_mut_obj_get(row, "titleId")); const auto installed_storage = yyjson_mut_get_str(yyjson_mut_obj_get(row, "storage"));
+                if (!installed_kind || !installed_id || !installed_storage) return Fail("Inventory", "游戏清单不完整");
+                const auto installed_version = yyjson_mut_get_uint(yyjson_mut_obj_get(row, "version")); bool match{};
+                size_t old_index{}, old_max{}; yyjson_val* old{};
+                yyjson_arr_foreach(before, old_index, old_max, old) if (String(old, "titleId") == installed_id && String(old, "kind") == installed_kind && String(old, "storage") == installed_storage && Number(old, "version") == installed_version && Number(old, "size") == yyjson_mut_get_uint(yyjson_mut_obj_get(row, "size"))) match = true;
+                if (!match) return Fail("InventoryChanged", "确认后游戏组件发生变化");
+                if (std::string_view(installed_kind) == "Base") has_base = true;
+                if (std::string_view(installed_kind) == "DLC" && required_dlc && std::string_view(installed_id) == required_dlc) has_required_dlc = true;
+                if (std::string_view(installed_kind) == "Base" || std::string_view(installed_kind) == "Update") app_version = std::max(app_version, installed_version);
+                if (normalized_id == installed_id && installed_version > version) return Fail("Downgrade", "拒绝自动降级组件");
+            }
+            if (!has_base || !has_required_dlc || yyjson_mut_get_uint(yyjson_mut_obj_get(component, "requiredApplicationVersion")) > app_version) return Fail("Dependency", "缺少对应地区本体、DLC 或所需游戏更新");
+            operation_id = String(args, "operationId"); if (!ValidOperationId(operation_id)) return Fail("OperationId", "操作标识无效");
+            if (OpenOperationRecord(OperationBase(operation_id))) return Fail("OperationExists", "此安装操作已有记录，请先核对实际版本");
+            if (errno != ENOENT) return Fail("OperationLog", "无法检查已有安装记录");
+            operation_save.application_id = std::strtoull(app.c_str(), nullptr, 16);
+            if (!RecordOperation(operation_id, "installing", operation_save, "", String(expected, "sha256"))) return Fail("OperationLog", "无法保存安装日志，未执行安装");
+            config.allow_downgrade = false; config.skip_if_already_installed = true; config.ticket_only = false; config.skip_base = false; config.skip_patch = false;
+            config.skip_addon = false; config.skip_data_patch = false; config.skip_ticket = false; config.skip_rsa_header_fixed_key_verify = false; config.skip_rsa_npdm_fixed_key_verify = false; config.ignore_distribution_bit = false;
+            config.title_ids = {std::strtoull(id.c_str(), nullptr, 16)};
+        }
+        const auto rc = yati::InstallFromSource(progress, &source, fs::FsPath(name), config, source.size);
+        if (managed && !RecordOperation(operation_id, R_SUCCEEDED(rc) ? "verify-required" : "needs-inspection", operation_save, "", "")) return Fail("OperationLog", "安装操作已结束，但日志未能保存，请复读实际版本");
+        if (rc == NcaHeaderSignatureMismatchResult && error_code.empty() && error_message.empty())
+            return Fail("NcaHeaderSignatureInvalid", "NCA 头部 RSA 签名校验失败；请核对安装包与签名兼容选项，Result=" + Hex(rc));
+        if (R_SUCCEEDED(rc)) {
+            const auto warnings = json.Arr();
+            for (const auto& warning : hash_warnings) {
+                const auto row = json.Obj(); json.Str(row, "code", "NcaHashMismatch"); json.Str(row, "entry", warning.entry);
+                json.Str(row, "expectedContentId", warning.expected_content_id); json.Str(row, "actualSha256", warning.actual_sha256);
+                json.Push(warnings, row);
+            }
+            for (const auto& warning : signature_warnings) {
+                const auto row = json.Obj(); json.Str(row, "code", "NcaHeaderSignatureMismatch"); json.Str(row, "entry", warning.entry);
+                json.Str(row, "headerSha256", warning.header_sha256); json.Str(row, "verificationResult", Hex(warning.verification_result));
+                json.Push(warnings, row);
+            }
+            json.Add(result, "warnings", warnings);
+        }
+        progress_done = 0; progress_total = 0; return rc;
+    }
+    // Chunk uploads are consumed before validation so an error cannot leave a binary
+    // frame in front of the next request.
+    std::vector<u8> upload;
+    if (method == "write.chunk") { Kind kind{}; R_TRY(Read(kind, upload, 10000000000ULL)); if (kind != Kind::Binary || upload.size() > Chunk) return Fail("ChunkSize", "文件块无效");
+    }
+    const auto key = String(args, "handle"); const auto it = handles.find(key);
+    if (it == handles.end()) return Fail("UnknownHandle", "操作已结束或连接已变化，请重试");
+    auto& handle = *it->second;
+    if (method == "handle.close") { handles.erase(it); return 0; }
+    if ((handle.kind == "upload" && !handle.file) || handle.live_started)
+        return Fail("HandleClosed", "此写入已结束，请关闭句柄并核对结果");
+    if (method == "handle.tree") {
+        if (handle.kind != "save") return Fail("HandleType", "操作类型错误");
+        std::vector<TreeItem> entries;
+        if (!Tree(handle.root, "", entries)) return Fail("SaveRead", "读取存档文件列表失败");
+        result = json.Arr();
+        for (const auto& item : entries) { const auto row = json.Obj(); json.Str(row, "name", item.path); json.Str(row, "path", item.path); json.Bool(row, "isDirectory", item.directory); json.Num(row, "size", item.size); json.Push(result, row); } return 0;
+    }
+    if (method == "read.chunk") {
+        const auto offset = Number(args, "offset"), length = Number(args, "length"); if (length > Chunk || offset > INT64_MAX) return Fail("ChunkBounds", "文件块越界");
+        binary.resize(length); u64 actual{};
+        if (handle.kind == "export") {
+            const auto read = ReadExportChunk(binary, offset, handle.size, [&](std::span<u8> target, std::uint64_t position) {
+                u64 count{};
+                const auto rc = handle.exports.front().Read(target.data(), static_cast<s64>(position), static_cast<s64>(target.size()), &count);
+                return ExportSegmentRead{rc, count};
+            });
+            if (read.state == ExportReadState::OutOfRange) return Fail("ChunkBounds", "内容读取越界");
+            if (read.state != ExportReadState::Complete) {
+                const auto detail = "导出内容读取不完整：偏移 " + std::to_string(offset + read.completed) +
+                    "，请求 " + std::to_string(length) + "，已读 " + std::to_string(read.completed) +
+                    "，本段返回 " + std::to_string(read.reported) + "，底层结果 " + std::to_string(read.error);
+                return Fail(read.state == ExportReadState::ReadError ? "ExportRead" : "ExportShortRead", detail);
+            }
+            actual = read.completed;
+        }
+        else if (handle.kind == "file") { if (offset > handle.size || length > handle.size - offset) return Fail("ChunkBounds", "文件读取越界"); if (fseeko(handle.file.get(), offset, SEEK_SET)) return Fail("Seek", "文件定位失败"); actual = std::fread(binary.data(), 1, length, handle.file.get()); }
+        else if (handle.kind == "save") {
+            const auto path = String(args, "path"); if (!ValidRelative(path)) return Fail("InvalidPath", "存档路径无效"); auto file = Open(handle.root + '/' + path, "rb");
+            if (!file || fseeko(file.get(), offset, SEEK_SET)) return Fail("SaveRead", "打开存档文件失败");
+            actual = std::fread(binary.data(), 1, length, file.get());
+        } else return Fail("HandleType", "操作不可读取");
+        if (actual != length) return Fail("ShortRead", "文件内容在读取期间发生变化");
+        json.Num(result, "binaryLength", length); return 0;
+    }
+    if (method == "saves.restore.file") {
+        if (handle.kind != "restore") return Fail("HandleType", "操作类型错误");
+        const auto path = String(args, "path"); const auto expected = handle.expected.find(path);
+        if (!ValidRelative(path) || expected == handle.expected.end() || Number(args, "size") != expected->second.size || !SameDigest(String(args, "sha256"), expected->second.sha)) return Fail("Manifest", "恢复文件与清单不一致");
+        const auto target = handle.root + '/' + path; const auto parent = target.substr(0, target.find_last_of('/'));
+        if (!Mkdirs(parent)) return Fail("StageCreate", "创建暂存目录失败");
+        auto file = Open(target, "wb");
+        if (!file) return Fail("StageWrite", "创建暂存文件失败");
+        expected->second.written = 0; return 0;
+    }
+    if (method == "write.chunk") {
+        const auto offset = Number(args, "offset");
+        if (handle.kind == "upload") {
+            if (offset != handle.written || upload.size() > handle.size - handle.written) return Fail("ChunkBounds", "上传块位置无效");
+            if (std::fwrite(upload.data(), 1, upload.size(), handle.file.get()) != upload.size()) return Fail("NoSpace", "写入失败，请检查空间");
+            handle.written += upload.size(); return 0;
+        }
+        if (handle.kind == "restore") {
+            const auto path = String(args, "path"); const auto expected = handle.expected.find(path);
+            if (!ValidRelative(path) || expected == handle.expected.end() || offset != expected->second.written || upload.size() > expected->second.size - offset) return Fail("ChunkBounds", "恢复文件块越界");
+            auto file = Open(handle.root + '/' + path, "ab"); if (!file || std::fwrite(upload.data(), 1, upload.size(), file.get()) != upload.size()) return Fail("NoSpace", "暂存恢复文件失败"); expected->second.written += upload.size(); return 0;
+        } return Fail("HandleType", "操作不可写入");
+    }
+    if (method == "fs.write.commit") {
+        if (handle.kind != "upload" || handle.written != handle.size) return Fail("Incomplete", "文件尚未传输完整");
+        if (std::fflush(handle.file.get()) || fsync(fileno(handle.file.get()))) return Fail("Flush", "写入数据未能保存");
+        handle.file.reset();
+        struct stat info{}; if (!stat(handle.target.c_str(), &info)) return Fail("Exists", "目标文件已存在");
+        if (rename(handle.temporary.c_str(), handle.target.c_str())) return Fail("Commit", "完成文件传输失败");
+        handle.committed = true; return 0;
+    }
+    if (method == "saves.restore.commit") {
+        ManagementLocked(true); ON_SCOPE_EXIT(ManagementLocked(false));
+        if (handle.kind != "restore") return Fail("HandleType", "操作类型错误");
+        for (const auto& [path, expected] : handle.expected)
+            if (expected.written != expected.size || !SameDigest(HashFile(handle.root + '/' + path), expected.sha)) return Fail("Integrity", "恢复文件未完整传输或校验失败");
+        Handle live; { const auto rc = Mount(live, handle.save); if (R_FAILED(rc)) return Fail("SaveMount", "挂载存档失败（存档可能损坏或被占用），Result=" + Hex(rc)); } std::vector<TreeItem> entries; if (!Tree(live.root, "", entries)) return Fail("SaveRead", "读取当前存档失败");
+        const auto before = TreeFingerprint(live.root, entries);
+        if (!SameDigest(before, handle.target_fingerprint)) return Fail("TargetChanged", "暂存期间目标存档已变化，未覆盖");
+        u64 old_bytes{}, new_bytes{}; for (const auto& item : entries) if (!item.directory) { if (item.size > UINT64_MAX - old_bytes) return Fail("SaveCapacity", "目标大小溢出"); old_bytes += item.size; }
+        for (const auto& [path, expected] : handle.expected) { if (expected.size > UINT64_MAX - new_bytes) return Fail("SaveCapacity", "输出大小溢出"); new_bytes += expected.size; }
+        FsSaveDataExtraData extra{}; { const auto rc = fsReadSaveDataFileSystemExtraDataBySaveDataSpaceId(&extra, sizeof(extra), static_cast<FsSaveDataSpaceId>(handle.save.save_data_space_id), handle.save.save_data_id); if (R_FAILED(rc)) return Fail("SaveExtra", "读取存档元数据失败，Result=" + Hex(rc)); }
+        if (extra.data_size <= 0 || extra.journal_size <= 0 || !RestoreFits(extra.data_size, extra.journal_size, old_bytes, new_bytes, entries.size() + handle.expected.size() + handle.directories.size())) return Fail("SaveJournalCapacity", "提交空间发生变化，未修改目标");
+        s64 total{}, free{}; { const auto rc = nsGetStorageSize(NcmStorageId_SdCard, &total, &free); if (R_FAILED(rc)) return Fail("StorageSize", "读取 SD 卡容量失败（建立恢复副本前检查），Result=" + Hex(rc)); }
+        if (free < 0 || old_bytes > static_cast<u64>(free) || static_cast<u64>(free) - old_bytes < 1024 * 1024) return Fail("NoSpace", "SD 卡空间不足以建立本机恢复副本，未修改目标");
+        const auto recovery = "sdmc:/switch/SwitchDesk/Recovery/" + handle.operation_id;
+        if (!Mkdirs(recovery)) return Fail("RecoveryCreate", "无法创建恢复目录，未修改目标");
+        for (const auto& item : entries) {
+            const auto target = recovery + '/' + item.path;
+            if (!Mkdirs(item.directory ? target : target.substr(0, target.find_last_of('/'))) || (!item.directory && !CopyFileChecked(live.root + '/' + item.path, target, item.size)))
+                return Fail("RecoveryWrite", "恢复副本写入失败，未修改目标");
+        }
+        if (!SameDigest(before, TreeFingerprint(recovery, entries))) return Fail("RecoveryVerify", "恢复副本校验失败，未修改目标");
+        if (!RecordOperation(handle.operation_id, "writing", handle.save, recovery, before)) return Fail("OperationLog", "无法保存恢复日志，未修改目标");
+        handle.live_started = true;
+        for (const auto& item : std::views::reverse(entries)) { const auto path = live.root + '/' + item.path; if (item.directory ? rmdir(path.c_str()) : unlink(path.c_str())) return Fail("RestoreWrite", "清理当前存档失败；电脑 Recovery 快照可用于恢复"); }
+        auto fs = fsdevGetDeviceFileSystem("sdksave:"); if (!fs) return Fail("SaveMount", "存档挂载已结束");
+        for (const auto& dir : handle.directories) if (!Mkdirs(live.root + '/' + dir)) return Fail("RestoreWrite", "创建存档目录失败");
+        auto buffer = std::make_unique<std::array<u8, Chunk>>();
+        for (const auto& [path, expected] : handle.expected) {
+            const auto target = live.root + '/' + path; if (!Mkdirs(target.substr(0, target.find_last_of('/')))) return Fail("RestoreWrite", "创建存档目录失败");
+            auto input = Open(handle.root + '/' + path, "rb"), output = Open(target, "wb"); if (!input || !output) return Fail("RestoreWrite", "无法打开恢复文件");
+            u64 copied{}; while (const auto count = std::fread(buffer->data(), 1, buffer->size(), input.get())) { if (std::fwrite(buffer->data(), 1, count, output.get()) != count) return Fail("RestoreWrite", "存档写入失败；保留了电脑 Recovery 快照"); copied += count; }
+            if (copied != expected.size || std::ferror(input.get()) || std::fflush(output.get())) return Fail("RestoreWrite", "存档写回不完整");
+            output.reset();
+        }
+        for (const auto& [path, expected] : handle.expected) if (!SameDigest(HashFile(live.root + '/' + path), expected.sha)) return Fail("RestoreVerify", "存档写回校验失败");
+        // No empty-save or per-file commits. Closing an uncommitted filesystem on any failure
+        // releases this transaction; the separately verified SD/PC before-images remain available.
+        { const auto rc = fsFsCommit(fs); if (R_FAILED(rc)) return Fail("SaveCommit", "存档提交失败（SD 卡可能已满或损坏）；电脑 Recovery 快照可用于恢复，Result=" + Hex(rc)); }
+        fsdevUnmountDevice(live.mount.c_str()); live.mount.clear();
+        { const auto rc = Mount(live, handle.save); if (R_FAILED(rc)) return Fail("SaveRemount", "存档提交后重新挂载失败，Result=" + Hex(rc)); }
+        for (const auto& [path, expected] : handle.expected) if (!SameDigest(HashFile(live.root + '/' + path), expected.sha)) return Fail("RestoreVerify", "提交后读回校验失败；恢复副本已保留");
+        if (!RecordOperation(handle.operation_id, "complete", handle.save, recovery, before)) return Fail("OperationLog", "存档已提交，但完成日志写入失败；请查询实际内容后处理");
+        handle.committed = true; RemoveTree(handle.root); json.Str(result, "operationId", handle.operation_id); return 0;
+    }
+    return Fail("UnknownMethod", "未知操作");
+}
+Result Server::Run() {
+    R_TRY(setsysInitialize()); ON_SCOPE_EXIT(setsysExit()); R_TRY(splInitialize()); ON_SCOPE_EXIT(splExit()); R_TRY(nsInitialize()); ON_SCOPE_EXIT(nsExit());
+    SetSysFirmwareVersion firmware{}; u64 atmosphere{};
+    const auto firmware_rc = setsysGetFirmwareVersion(&firmware);
+    const auto atmosphere_rc = splGetConfig(static_cast<SplConfigItem>(65000), &atmosphere);
+    const auto version = std::to_string((atmosphere >> 56) & 255) + '.' + std::to_string((atmosphere >> 48) & 255) + '.' + std::to_string((atmosphere >> 40) & 255);
+    ManagementDevice(R_SUCCEEDED(firmware_rc) ? firmware.display_version : "不可读取", R_SUCCEEDED(atmosphere_rc) ? version : "不可读取", App::IsEmummc() ? "emuMMC / 虚拟系统" : "sysMMC / 真实系统");
+    R_TRY(title::Init()); ON_SCOPE_EXIT(title::Exit()); DeviceId();
+    R_TRY(usb.Init()); progress->AddCancelEvent(usb.GetCancelEvent()); ON_SCOPE_EXIT(progress->RemoveCancelEvent(usb.GetCancelEvent()));
+    R_TRY(progress->ShouldExitResult());
+    R_TRY(usb.IsUsbConnected(UINT64_MAX));
+    while (!released && !progress->ShouldExit()) {
+        Kind kind{}; std::vector<u8> bytes; R_TRY(Read(kind, bytes)); R_UNLESS(kind == Kind::Request, Failure);
+        auto doc = std::unique_ptr<yyjson_doc, decltype(&yyjson_doc_free)>(yyjson_read(reinterpret_cast<const char*>(bytes.data()), bytes.size(), 0), &yyjson_doc_free); R_UNLESS(doc, Failure);
+        const auto root = yyjson_doc_get_root(doc.get()); const auto id = Number(root, "id"); const auto method = String(root, "method"); const auto args = yyjson_obj_get(root, "args");
+        if (!yyjson_is_obj(args) || method.empty() || handles.size() > 16) return Failure;
+        const std::lock_guard lock(request_mutex);
+        if (dbi_scheduled) return 0; // local handoff won the race with a new PC request
+        Json json; yyjson_mut_val* result{}; std::vector<u8> binary; error_code.clear(); error_message.clear();
+        const bool background = method == "device.info" || method == "titles.icon" || method == "hello";
+        if (!background) ManagementTask(method == "titles.list" || method == "storages.list" || method == "saves.list" ? "正在读取主机资料" : method == "titles.install" ? "正在安装内容" : method == "saves.restore.commit" ? "正在写回存档，请保持连接" : method.starts_with("saves.") ? "正在处理存档任务" : method == "read.chunk" ? "正在传输到电脑" : method == "write.chunk" ? "正在接收电脑文件" : "正在处理电脑任务");
+        const auto rc = Dispatch(method, args, json, result, binary);
+        transfer_open = !handles.empty();
+        if (cancelled) return Failure;
+        const auto response = json.Obj(); json.Num(response, "id", id); json.Bool(response, "ok", R_SUCCEEDED(rc));
+        if (R_SUCCEEDED(rc)) json.Add(response, "result", result);
+        else { const auto error = json.Obj(); json.Str(error, "code", error_code.empty() ? "HorizonError" : error_code); json.Str(error, "message", error_message.empty() ? "主机操作失败，Result=" + Hex(rc) : error_message); json.Add(response, "error", error); }
+        R_TRY(WriteJson(Kind::Response, json, response)); if (R_SUCCEEDED(rc) && yyjson_mut_obj_get(result, "binaryLength")) R_TRY(Write(Kind::Binary, binary));
+        if (handles.empty() && !background) ManagementTask({});
+    }
+    return 0;
+}
+} // namespace
+void LaunchDbiFromConsole(sphaira::ui::ProgressBox* box) {
+    const std::unique_lock lock(request_mutex, std::try_to_lock);
+    if (!lock.owns_lock()) { sphaira::App::Notify("正在处理电脑请求，请稍后打开 DBI"); return; }
+    const auto launch = ScheduleDbi();
+    if (!launch.path) { sphaira::App::Notify(launch.message); return; }
+    box->RequestExit();
+}
+void SetProgress(long long completed, long long total) { progress_done = completed; progress_total = total; ManagementProgress(completed, total); }
+void Launch() {
+    sphaira::App::SetMtpEnable(false); sphaira::App::SetFtpEnable(false); sphaira::App::SetHddEnable(false);
+    sphaira::App::Push<sphaira::ui::ProgressBox>(0, "SwitchDesk PC", "Connect USB to your computer. B to exit.", [](auto progress) -> Result {
+        while (!progress->ShouldExit()) {
+            bool released{};
+            { Server server(progress); const auto rc = server.Run(); released = server.released; if (released || progress->ShouldExit()) return rc; ManagementConnection(false, "连接中断或初始化失败，Result=" + Hex(rc)); }
+            progress->SetActionName("SwitchDesk PC").SetTitle("Waiting for USB connection..."); svcSleepThread(250000000);
+        } return 0;
+    }, [](Result) {
+        // ProgressBox has joined the USB worker. Return to hbloader even if this
+        // companion was launched as hbmenu and Sphaira selected HOME on exit.
+        if (dbi_scheduled) __nx_applet_exit_mode = 0;
+        sphaira::App::Exit();
+    });
+}
+} // namespace switchdesk

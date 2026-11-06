@@ -1,0 +1,246 @@
+using System.IO;
+using System.Windows;
+using Microsoft.Win32;
+using SwitchDesk.Core;
+
+namespace SwitchDesk.App;
+public partial class MainWindow
+{
+    private string AutoKey(SaveInfo save, DeviceInfo info) => info.DeviceId + "|" + info.Environment + "|" + save.Key;
+    private SaveViewModel ActiveSaves => vm.Page == "saves" ? vm.SaveLibrary.Detail : vm.Saves;
+    private Snapshot? ActiveSnapshot
+    {
+        get => vm.Page == "saves" ? vm.SaveLibrary.SelectedSnapshot : SnapshotsGrid.SelectedItem as Snapshot;
+        set { if (vm.Page == "saves") vm.SaveLibrary.SelectedSnapshot = value; else SnapshotsGrid.SelectedItem = value; }
+    }
+    private bool CanRestoreSnapshot(Snapshot? snapshot)
+    {
+        if (snapshot == null || device == null || ActiveSaves.Selected?.Live is not {} save) return false;
+        var manifest = snapshot.Manifest;
+        return manifest.DeviceId == device.DeviceId && manifest.Environment == device.Environment &&
+            manifest.TitleId == save.TitleId && manifest.UserId == save.UserId && manifest.SaveType == save.Type;
+    }
+    private SaveInfo SelectedSave() => ActiveSaves.Selected?.Live ?? throw new IOException("请选择此游戏的主机存档");
+    private void UpdateAutoPolicy()
+    { ActiveSaves.SetAutomatic(ActiveSaves.Selected?.Live is {} save && device != null && settings.AutoBackupKeys.Contains(AutoKey(save, device))); UpdateSettingsText(); }
+    private void SetAutoPolicy(bool enabled)
+    {
+        if (!vm.Online || device == null || ActiveSaves.Selected?.Live is not {} save) { ActiveSaves.SetAutomatic(false); return; }
+        var keys = settings.AutoBackupKeys.ToHashSet(); var key = AutoKey(save, device); if (enabled) keys.Add(key); else keys.Remove(key);
+        try { SaveSettings(settings with { AutoBackupKeys = keys.ToArray() }); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        { UpdateAutoPolicy(); vm.Notify("自动备份设置未保存：" + ex.Message); return; }
+        UpdateSettingsText();
+    }
+    private void ScheduleAutoBackups()
+    {
+        if (device == null) return; var targets = saves.Where(s => settings.AutoBackupKeys.Contains(AutoKey(s, device))).ToArray(); if (targets.Length == 0) return;
+        _ = Guard(async () => { foreach (var save in targets) await BackupAsync(save); vm.Notify($"自动备份完成 · {targets.Length} 项", settings.BackupDirectory); });
+    }
+    private Task<Snapshot> BackupAsync(SaveInfo save) => RunJob("备份 · " + save.GameName, async (job, ct) =>
+    {
+        var (peer, info) = RequireDevice("saves"); var store = new SnapshotStore(settings.BackupDirectory);
+        var snapshot = await store.BackupAsync(peer, info, save, Progress(job), ct); store.Prune(settings.Retention, ct, snapshot.Manifest); _ = Dispatcher.BeginInvoke(LoadLocalLists); return snapshot;
+    }, async () => { var result = await BackupAsync(save); vm.Notify("已备份", Path.GetDirectoryName(result.Path)!); });
+    private async Task RestoreAsync()
+    {
+        var save = SelectedSave(); var snapshot = ActiveSnapshot ?? throw new IOException("请选择历史版本"); var (_, info) = RequireDevice("saves"); var m = snapshot.Manifest;
+        if (m.DeviceId != info.DeviceId || m.Environment != info.Environment || m.TitleId != save.TitleId || m.UserId != save.UserId || m.SaveType != save.Type) throw new IOException("所选版本与当前主机、系统环境或用户不匹配");
+        if (!Dialogs.Confirm(this, "恢复存档", $"游戏  {save.GameName}\n用户  {save.UserName}\n系统  {info.Environment}\n版本  {snapshot.TimeText}\n\n先完整备份当前存档，再恢复所选版本。", "备份当前存档并恢复")) return;
+        var restored = await RunJob("恢复 · " + save.GameName, async (job, ct) =>
+        {
+            var (peer, current) = RequireDevice("saves");
+            var result = await new SnapshotStore(settings.BackupDirectory).RestoreAsync(peer, current, save, snapshot.Path, Progress(job), ct, expectedManifest: m);
+            return await CompleteRestoreAsync(result);
+        });
+        vm.Notify(restored.Warning ?? "存档已恢复 · 恢复前备份保留在 Recovery", Path.GetDirectoryName(restored.RecoveryPath)!);
+    }
+    private static SnapshotRestoreResult RestoreFollowupWarning(SnapshotRestoreResult result, Exception error) => result with
+    {
+        Warning = string.Join(Environment.NewLine, new[] { result.Warning,
+            "主机存档已写回，但后续复查或电脑记录刷新未完成；请重新检查同步，无需重复写回。" + error.Message }.Where(text => !string.IsNullOrEmpty(text)))
+    };
+    private async Task<SnapshotRestoreResult> CompleteRestoreAsync(SnapshotRestoreResult result, Func<Task>? followup = null)
+    {
+        // The write is already confirmed. Invalidate every pre-write plan before
+        // fallible readback, state persistence or UI refresh can run.
+        try
+        {
+            await Dispatcher.InvokeAsync(ClearSaveSyncResults);
+            if (followup != null) await followup();
+            await Dispatcher.InvokeAsync(LoadLocalLists);
+        }
+        catch (Exception error) { result = RestoreFollowupWarning(result, error); }
+        if (result.Warning != null) Log(result.Warning);
+        return result;
+    }
+    private async Task VerifySnapshotAsync()
+    { var snapshot = ActiveSnapshot ?? throw new IOException("请选择历史版本"); await RunJob("校验存档快照", async (_, ct) => await SnapshotStore.VerifyAsync(snapshot.Path, ct)); vm.Notify("快照校验通过", Path.GetDirectoryName(snapshot.Path)!); }
+    private async Task PickInstallAsync()
+    { var pick = new OpenFileDialog { Filter = "Switch 安装包|*.nsp;*.xci;*.nsz;*.xcz", Multiselect = true }; if (pick.ShowDialog(this) == true) await ReviewInstallAsync(pick.FileNames); }
+    private string TargetStorage => InstallStorage.SelectedValue?.ToString() ?? "SdCard";
+    private Task ReviewInstallAsync(string[] paths) => ReviewInstallCoreAsync(paths, null, null);
+    private Task ReviewDownloadedInstallAsync(ResourceDownload receipt, ContentEntry? expectedContent) =>
+        ReviewInstallCoreAsync([receipt.Path], receipt, expectedContent);
+    private async Task ReviewInstallCoreAsync(string[] paths, ResourceDownload? receipt, ContentEntry? expectedContent)
+    {
+        if (batchRunning || reviewing) throw new IOException("请先等待当前安装清单处理完毕");
+        var known = receipt == null ? KnownDownloadReceipts() : [];
+        var entries = paths.Select(Path.GetFullPath).Distinct(StringComparer.OrdinalIgnoreCase).Select(path =>
+        {
+            var item = new InstallEntry(path) { DownloadReceipts = receipt == null ? MatchingDownloadReceipts(path, known) : [receipt], ExpectedContent = expectedContent };
+            if (Path.GetExtension(path).ToLowerInvariant() is not (".nsp" or ".xci" or ".nsz" or ".xcz")) item.State = "格式不支持";
+            return item;
+        }).ToArray();
+        InstallOverlay.Visibility = Visibility.Visible; installEntries.Clear(); reviewedDevice = null;
+        foreach (var item in entries) installEntries.Add(item);
+        await InspectInstallEntriesAsync();
+    }
+    private static async Task ValidateInstallResourceAsync(InstallEntry entry, PackageInfo package, CancellationToken ct)
+    {
+        // Receipts for a shared cache path agree on length and digest. Each source may declare additional identity constraints.
+        if (entry.DownloadReceipts.FirstOrDefault() is {} first) await ResourceDownloads.VerifyAsync(first, ct);
+        foreach (var receipt in entry.DownloadReceipts)
+        {
+            if (receipt.Entry.TitleId is {} title)
+            {
+                if (!title.Equals(package.TitleId, StringComparison.OrdinalIgnoreCase) || package.Components is not { Length: > 0 } ||
+                    package.Components.Any(c => c.ApplicationId is {} owner && !owner.Equals(title, StringComparison.OrdinalIgnoreCase)))
+                    throw new InvalidDataException("安装包实际游戏或组件归属与资源声明不一致");
+                if (package.Components.Length > 1 && package.Components.Any(c => c.ApplicationId == null))
+                    throw new InvalidDataException("混合安装包缺少完整组件归属信息，请使用新版配套核对");
+            }
+            if (receipt.ExpectedContent is {} declared) ContentSources.ValidateInspected(declared, package);
+        }
+        if (entry.ExpectedContent is {} expected && entry.DownloadReceipts.All(r => r.ExpectedContent != expected))
+            ContentSources.ValidateInspected(expected, package);
+    }
+    private async Task InspectInstallEntriesAsync()
+    {
+        reviewing = true; StartInstall.IsEnabled = InstallHashCompatibility.IsEnabled = false; InstallError.Text = "";
+        try
+        {
+            var (_, info) = RequireDevice("inspect"); reviewedDevice = info; InstallContext.Text = $"{info.Model} · {info.Environment} · 开始前将重新核对主机、文件和空间";
+            await RunJob("整理安装清单", async (_, ct) =>
+            {
+                foreach (var entry in installEntries.ToArray().Where(x => x.State != "格式不支持" && x.IsPending))
+                {
+                    try
+                    {
+                        await Dispatcher.InvokeAsync(() => { entry.Source = null; entry.Refresh(); });
+                        var before = new FileInfo(entry.Path); var length = before.Length; var time = before.LastWriteTimeUtc;
+                        var (peer, _) = RequireDevice("inspect"); var package = await Transfers.InspectAsync(peer, entry.Path, ct); var source = new InstallSource(entry.Path, length, time, package); source.Validate();
+                        await ValidateInstallResourceAsync(entry, package, ct);
+                        var existing = titles.SelectMany(g => g.Components).Where(x => package.Components.Any(c => c.TitleId.Equals(x.TitleId, StringComparison.OrdinalIgnoreCase))).ToArray();
+                        await Dispatcher.InvokeAsync(() => { entry.Source = source; entry.State = existing.Length > 0 ? "已有 " + string.Join(" / ", existing.Select(x => x.KindText + " v" + x.Version)) : "就绪"; entry.Refresh(); });
+                    }
+                    catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException)
+                    {
+                        Log($"识别失败：{entry.Name} · {ex.GetType().Name} · {ex.Message}");
+                        await Dispatcher.InvokeAsync(() => { entry.Source = null; entry.State = ex.Message; entry.Refresh(); });
+                    }
+                }
+                var (current, _) = RequireDevice(); var volumes = await current.QueryAsync<StorageInfo[]>("storages.list", ct: ct); await Dispatcher.InvokeAsync(() => vm.Storages = volumes); return true;
+            });
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { Log("安装清单失败：" + ex.GetType().Name + " · " + ex.Message); InstallError.Text = ex.Message; }
+        finally { reviewing = false; UpdateInstallSummary(); }
+    }
+    private void UpdateInstallSummary()
+    {
+        if (!initialized) return;
+        var pending = installEntries.Where(x => x.IsPending).ToArray(); var required = pending.Sum(x => x.Source?.Package.RequiredBytes ?? 0); var target = vm.Storages.FirstOrDefault(x => x.Id == TargetStorage);
+        InstallSummary.Text = $"预计需要 {Display.Size(required)} · 可用 {(target == null ? "待连接" : Display.Size(target.FreeBytes))}"; StartInstall.Content = $"开始安装 {pending.Length} 项";
+        StartInstall.IsEnabled = !batchRunning && !reviewing && pending.Length > 0 && pending.All(x => x.Source != null) && vm.Online && required <= (target?.FreeBytes ?? 0);
+        if (target != null && required > target.FreeBytes) InstallError.Text = "目标空间不足，请更换存储位置或整理主机空间";
+        else if (InstallError.Text.StartsWith("目标空间不足", StringComparison.Ordinal)) InstallError.Text = "";
+        InstallStorage.IsEnabled = InstallHashCompatibility.IsEnabled = !batchRunning && !reviewing;
+        RetryInstall.Visibility = SkipInstall.Visibility = installEntries.Any(x => x.State.StartsWith("失败", StringComparison.Ordinal)) ? Visibility.Visible : Visibility.Collapsed;
+    }
+    private async Task ExecuteInstallAsync(bool skipFailed = false)
+    {
+        if (batchRunning || reviewing) return;
+        if (skipFailed) foreach (var entry in installEntries.Where(x => x.State.StartsWith("失败", StringComparison.Ordinal))) entry.State = "已跳过";
+        var pending = installEntries.Where(x => x.IsPending).ToArray(); var targetId = TargetStorage;
+        var compatible = InstallHashCompatibility.IsChecked == true;
+        var hashPolicy = compatible ? NcaHashPolicy.Warn : NcaHashPolicy.Strict;
+        var signaturePolicy = compatible ? NcaSignaturePolicy.Warn : NcaSignaturePolicy.Strict;
+        if (pending.Length == 0) { UpdateInstallSummary(); return; }
+        batchRunning = true; InstallError.Text = ""; InstallStorage.IsEnabled = InstallHashCompatibility.IsEnabled = StartInstall.IsEnabled = RetryInstall.IsEnabled = SkipInstall.IsEnabled = false;
+        try
+        {
+            var reviewed = reviewedDevice ?? throw new IOException("请先重新识别清单");
+            await RunJob("批量安装 · " + pending.Length + " 项", async (job, ct) =>
+            {
+                var (peer, _) = RequireDevice("install"); var current = await peer.QueryAsync<DeviceInfo>("device.info", ct: ct); var volumes = await peer.QueryAsync<StorageInfo[]>("storages.list", ct: ct);
+                foreach (var entry in pending) await ValidateInstallResourceAsync(entry, entry.Source?.Package ?? throw new IOException("存在未识别文件"), ct);
+                var target = volumes.FirstOrDefault(v => v.Id == targetId) ?? throw new IOException("目标存储不可用"); InstallBatch.Validate(pending.Select(x => x.Source ?? throw new IOException("存在未识别文件")), reviewed, current, target);
+                foreach (var entry in pending)
+                {
+                    try
+                    {
+                        entry.Source!.Validate(); await Dispatcher.InvokeAsync(() => entry.State = "安装中");
+                        var receipt = entry.DownloadReceipts.FirstOrDefault();
+                        var result = await Transfers.InstallAsync(peer, entry.Path, targetId, Progress(job), ct,
+                            receipt?.Sha256, receipt?.Size, hashPolicy, signaturePolicy);
+                        await Dispatcher.InvokeAsync(() =>
+                        {
+                            entry.Complete(result);
+                            if (entry.HasWarnings) InstallGrid.SelectedItem = entry;
+                            var warningEntries = pending.Where(item => item.HasWarnings).ToArray();
+                            job.Result = warningEntries.Length == 0 ? "" : $"已完成文件含 {warningEntries.Sum(item => item.WarningCount)} 项校验提示" + Environment.NewLine +
+                                string.Join(Environment.NewLine + Environment.NewLine, warningEntries.Select(item => item.Name + Environment.NewLine + item.WarningText));
+                        });
+                        foreach (var warning in result.Warnings) Log(entry.Name + " · " + warning.Message);
+                    }
+                    catch (Exception ex) { await Dispatcher.InvokeAsync(() => entry.State = "失败 · " + ex.Message); throw; }
+                }
+                await RefreshDeviceAsync(ct); return true;
+            });
+            var warningCount = pending.Sum(entry => entry.WarningCount);
+            vm.Notify($"批量安装完成 · {pending.Length} 项" + (warningCount > 0 ? $" · {warningCount} 项校验提示" : ""));
+            if (warningCount == 0) InstallOverlay.Visibility = Visibility.Collapsed;
+        }
+        catch (Exception ex) { InstallError.Text = ex.Message + "；已完成项目保留，后续项目等待重试或跳过。"; }
+        finally { batchRunning = false; RetryInstall.IsEnabled = SkipInstall.IsEnabled = true; UpdateInstallSummary(); }
+    }
+    private async void OnStartInstall(object sender, RoutedEventArgs e) => await ExecuteInstallAsync();
+    private async void OnRetryInstall(object sender, RoutedEventArgs e) => await ExecuteInstallAsync();
+    private async void OnSkipInstall(object sender, RoutedEventArgs e) => await ExecuteInstallAsync(true);
+    private async void OnReviewAgain(object sender, RoutedEventArgs e) { if (!batchRunning && !reviewing) await InspectInstallEntriesAsync(); }
+    private void OnCopyInstallWarnings(object sender, RoutedEventArgs e) =>
+        CopyDiagnosticValue((InstallGrid.SelectedItem as InstallEntry)?.WarningText, "安装校验提示已复制");
+    private void OnCopyInstallInfo(object sender, RoutedEventArgs e) => CopyDiagnosticValue(
+        InstallError.Text + Environment.NewLine + string.Join(Environment.NewLine + Environment.NewLine,
+            installEntries.Select(entry => entry.Name + " · " + entry.State + (entry.HasWarnings ? Environment.NewLine + entry.WarningText : ""))),
+        "安装信息已复制");
+    private void OnInstallStorage(object sender, System.Windows.Controls.SelectionChangedEventArgs e) { if (initialized) UpdateInstallSummary(); }
+    private void OnCloseInstall(object sender, RoutedEventArgs e) { if (!batchRunning && !reviewing) InstallOverlay.Visibility = Visibility.Collapsed; else InstallError.Text = "请在任务栏取消，或等待当前任务完成。"; }
+    private void OnInstallDragOver(object sender, DragEventArgs e) { e.Effects = e.Data.GetDataPresent(DataFormats.FileDrop) ? DragDropEffects.Copy : DragDropEffects.None; e.Handled = true; }
+    private async void OnInstallDrop(object sender, DragEventArgs e) { if (e.Data.GetData(DataFormats.FileDrop) is string[] paths) await Guard(() => ReviewInstallAsync(paths)); }
+    private async Task ExportAsync()
+    {
+        var card = vm.Library.Selected ?? throw new IOException("请选择游戏"); var game = card.Console ?? throw new IOException("游戏尚未安装在主机");
+        var components = card.Components.Where(x => x.Selected).Select(x => x.Value).ToArray(); if (components.Length == 0) throw new IOException("请勾选要导出的本体、更新或 DLC"); var directory = settings.ExportDirectory;
+        foreach (var component in components) await RunJob("导出 · " + game.Name + " · " + component.KindText, async (job, ct) => { var (peer, info) = RequireDevice("export"); await Transfers.ExportGameAsync(peer, info, game, component, directory, Progress(job), ct); return true; });
+        await ScanLibraryAsync(directory, false); vm.Notify($"已导出 {components.Length} 个组件", directory);
+    }
+    private LibraryItem SelectedLocal() => LocalFiles.SelectedItem as LibraryItem ?? throw new IOException("请选择电脑中的文件");
+    private async Task AddLibraryAsync()
+    { var pick = new OpenFolderDialog { Title = "添加电脑游戏目录" }; if (pick.ShowDialog(this) == true) { SaveSettings(settings with { LibraryDirectory = pick.FolderName }); await ScanLibraryAsync(pick.FolderName); } }
+    private async Task ScanLibraryAsync(string directory, bool notify = true)
+    { await RunJob("扫描电脑游戏目录", async (_, ct) => { await library.ScanAsync(directory, ct); await Dispatcher.InvokeAsync(LoadLocalLists); return true; }); if (notify) vm.Notify("电脑游戏库已更新", directory); }
+    private async Task VerifyLocalAsync()
+    {
+        var item = SelectedLocal(); var captured = item;
+        var result = await RunJob("校验 · " + captured.Name, async (_, ct) => { var value = await library.VerifyAsync(captured, ct); await Dispatcher.InvokeAsync(LoadLocalLists); return value; }, () => RunJob("校验 · " + captured.Name, async (_, ct) => { var value = await library.VerifyAsync(captured, ct); await Dispatcher.InvokeAsync(LoadLocalLists); return value; }));
+        vm.Notify(result.Status, Path.GetDirectoryName(captured.Path)!);
+    }
+    private async Task InspectLocalAsync()
+    {
+        var item = SelectedLocal(); await RunJob("识别 · " + item.Name, async (_, ct) =>
+        { var (peer, _) = RequireDevice("inspect"); var result = await Transfers.InspectAsync(peer, item.Path, ct); if (!result.Recognized) throw new IOException(result.Detail ?? "无法识别安装包");
+          library.Upsert(item with { Name = result.GameName ?? item.Name, TitleId = result.TitleId, Kind = string.Join("+", result.Components.Select(x => x.Kind).Distinct()), Version = string.Join(",", result.Components.Select(x => x.Version).Distinct()), Status = "已识别" }); await Dispatcher.InvokeAsync(LoadLocalLists); return true; }); vm.Notify("安装包已识别");
+    }
+}

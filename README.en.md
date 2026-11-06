@@ -1,0 +1,67 @@
+<div align="center">
+  <img src="docs/images/logo.svg" width="80" height="80" alt="SwitchDesk logo">
+  <h1>SwitchDesk</h1>
+  <p><strong>Manage your Switch games, saves and SD files.</strong></p>
+  <p>A game, console-save and SD-file manager for Atmosphère-enabled Nintendo Switch consoles. Runs on Windows.</p>
+  <p><a href="https://github.com/yishengpoxiao/SwitchDesk/releases">Development releases</a> · <a href="docs/INSTALL.md">Get started</a> · <a href="docs/STATUS.md">Test status</a> · <a href="docs/BUILD.md">Build</a> · <a href="README.md">简体中文</a></p>
+  <p><a href="https://github.com/yishengpoxiao/SwitchDesk/actions/workflows/build.yml"><img src="https://github.com/yishengpoxiao/SwitchDesk/actions/workflows/build.yml/badge.svg" alt="Build and verify"></a> <img src="https://img.shields.io/badge/Windows-x64-2563EB" alt="Windows x64"> <img src="https://img.shields.io/badge/.NET-10-512BD4" alt=".NET 10"> <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0-blue" alt="GPL-3.0"></a> <img src="https://img.shields.io/badge/status-development_preview-E8A23B" alt="Development preview"></p>
+</div>
+
+Maintained by **一生破晓** ([yishengpoxiao](https://github.com/yishengpoxiao)), this project is an improved derivative of [Humboldt-Zh/SwitchDesk](https://github.com/Humboldt-Zh/SwitchDesk), under GPL-3.0. Original project and third-party credits and licenses are preserved. Project home: [yishengpoxiao/SwitchDesk](https://github.com/yishengpoxiao/SwitchDesk).
+
+
+Use a Windows PC and USB to manage games, saves and SD files on your Switch. Browse console content, back up Switch saves to the PC, and access file-transfer and restore tools. The local library organizes installation packages and exported content.
+
+> **Historical upstream preview:** the original project published Windows **0.2.5**, Switch companion **0.2.4**, protocol **1**. Startup, controls and USB inventory reads have been checked on one OLED console. See [validation records](docs/STATUS.md) and [known issues](docs/KNOWN-ISSUES.md).
+>
+> **Current development source: 0.3.0-dev.2.** It adds a separate save library and timeline, sidebar cross-save navigation, the NSP export fix and bundled SysDVR resources. The latest local review passed **307 C# tests and 97 WPF renders**; see the [2026-11-06 review](docs/CODE-REVIEW-2026-11-06.md). No new Release has been published; **zero migration combinations are enabled**, and hardware acceptance remains pending. The export fix requires manually replacing the NRO with the matching development build; updating only Windows does not fix the old companion. See [development package scope](docs/PHASE2-DEVELOPMENT-PACK.md), [fix validation](docs/FIELD-FIXES-2026-11-03.md) and [USB preview setup](docs/USB-STREAMING.md).
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/library-dark.png">
+  <img src="docs/images/library-light.png" alt="The SwitchDesk game library with navigation and a details panel">
+</picture>
+
+*Actual WPF offscreen renders of the current derivative, using labelled synthetic games, covers and the test account 一生破晓. These demonstrate layout, not a real console session. The UI and detailed documentation are in Simplified Chinese.*
+
+## Features
+
+- **Console overview:** model, firmware, Atmosphère, environment and storage. emuMMC user storage is identified explicitly.
+- **A unified library:** search console games and PC packages, switch between grid and list views, and inspect base/update/installed DLC components. Unknown packages remain unidentified until parsed.
+- **Switch save tools:** back up saves belonging to console games/users to the PC, with ZIP snapshots with manifests and hashes, history, deduplication, connection-triggered backups, pre-restore recovery copies and Explorer drag-out support.
+- **Content transfers:** SD file browsing and bidirectional transfers, protected paths, batch installation review and component-based export.
+- **A focused workspace:** light/dark/system themes, keyboard controls and timestamped offline records. Task history lives in diagnostics.
+- **Streaming entry point:** launch the official SysDVR client as a separate process. Published 0.2.5 requires separate setup; the dev.2 package includes its runtime and console installation resources. See [USB preview setup and limits](docs/USB-STREAMING.md).
+
+Save writeback is **not atomic across power loss**. Read the [known issues](docs/KNOWN-ISSUES.md) and keep an independent recovery copy.
+
+## Can it update Switch games?
+
+The published 0.2.5 preview processes matching local Patch packages through its USB installation entry point; it does not discover or download updates online. Current dev.2 source adds public metadata checks and download, verification and review of packages from user-configured sources. It does not provide a game download service. Packages must match the base game and target system, and real installation acceptance remains pending. See [published update scope](docs/GAME-UPDATES.md) and [development source configuration](docs/CONTENT-SOURCES.md).
+
+## Get started
+
+You need Windows x64, a first-generation Switch already running Atmosphère, and a USB data cable. The tested PC runs Windows 11. Unmodified retail firmware cannot run the companion NRO.
+
+1. Build this derivative from source, or download matching packages when available in **[Releases](https://github.com/yishengpoxiao/SwitchDesk/releases)**. Check the supplied source and `SHA256SUMS.txt`; local development packages are in `dist/`. The Windows package includes the .NET runtime.
+2. Copy the NRO to `/switch/SwitchDesk/SwitchDesk.nro` and launch it in **full application mode**.
+3. Connect USB and run `SwitchDesk.exe`. If detection fails, use Connection Diagnostics to inspect WinUSB binding and the **SwitchDesk PC** product name.
+
+See the [installation guide](docs/INSTALL.md) for driver details and updates. Local library browsing and file verification are available without a console.
+
+## Validation and development
+
+Current **0.3.0-dev.2** source provides a separate save library with source-isolated timelines and a sidebar cross-save page that discovers progress files after game/user selection. Local checks on **2026-11-03** passed **145 tests, 72 WPF renders, Windows and NRO builds, and portable native ASan/UBSan checks**. These are local results, not a claim that this PR's GitHub CI has passed. Only the Vampire Survivors and Dead Cells Switch identities are verified; the other four remain pending. **Cross-save migration and native HOME hiding remain disabled.** The new export and USB audio/video paths still need hardware acceptance. No new Release is included in this source update.
+
+The following records describe the **published 0.2.5 / 0.2.4** baseline:
+
+As of **2026-10-23**, local checks include 70 automated tests, a 500-item UI fixture, and WPF render checks for light/dark themes at three window widths and two render scales. These are not physical monitor-DPI tests.
+
+The tested hardware baseline is OLED / HOS 20.4.0 / Atmosphère 1.9.4 / emuMMC / full application mode. Companion 0.2.4 startup, X/B controls, reopening and one USB inventory read passed. This does not establish compatibility with every model or firmware.
+
+The desktop uses C# / WPF / .NET 10; the companion uses C++ / libnx and pinned Sphaira sources. Build instructions and roadmap: [Build](docs/BUILD.md) · [Protocol](docs/PROTOCOL.md) · [Roadmap](docs/ROADMAP.md) · [Contributing](CONTRIBUTING.md). The [published validation record](docs/STATUS.md) links its dated CI run; those historical results do not establish the status of a new source update.
+
+## Credits and license
+
+The Switch companion extends [Sphaira 1.0.8](https://github.com/NaGaa95/sphaira), including its installation, export, save and USB code. Thanks to [libnx](https://github.com/switchbrew/libnx), [Atmosphère](https://github.com/Atmosphere-NX/Atmosphere), [.NET / WPF](https://github.com/dotnet/wpf) and their contributors. [SysDVR](https://github.com/exelix11/SysDVR) runs as a separate process: it was not bundled with 0.2.5; dev.2 packages include its official runtime, console resources, corresponding source and license notices. See [third-party notices](THIRD-PARTY-NOTICES.md).
+
+Licensed under **[GPL-3.0](LICENSE)**; see [third-party notices](THIRD-PARTY-NOTICES.md). Binary releases must include matching corresponding source. No games, firmware, console keys, account data or private saves are included. This project is not affiliated with Nintendo.

@@ -1,0 +1,68 @@
+name: Build and verify
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  native-sanitizers:
+    runs-on: ubuntu-latest
+    env:
+      UBSAN_OPTIONS: halt_on_error=1
+    steps:
+      - uses: actions/checkout@v4
+      - run: g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=address,undefined -fno-omit-frame-pointer -Icompanion/include companion/tests/native_tests.cpp -o native-tests
+      - run: ./native-tests
+      - run: g++ -std=c++20 -O1 -g -Wall -Wextra -Wpedantic -Werror -fsanitize=address,undefined -fno-omit-frame-pointer companion/tests/argv_tests.cpp -o argv-tests
+      - run: ./argv-tests
+      - run: python3 scripts/test-cnmt.py --sanitize --verify-regression
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/cache@v4
+        with:
+          path: vendor/streaming/cache
+          key: ${{ runner.os }}-streaming-${{ hashFiles('streaming-dependencies.lock.json') }}
+      - shell: pwsh
+        run: ./scripts/build.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SwitchDesk-Windows-x64
+          path: artifacts/Windows/
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 tests/test_macos_build.py
+      - run: python3 scripts/build-macos.py --dotnet dotnet
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SwitchDesk-macOS-${{ matrix.runner }}
+          path: artifacts/macOS/
+  companion:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    container: devkitpro/devkita64:latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pacman -Syu --noconfirm switch-dev switch-cmake deko3d switch-curl switch-glm switch-zlib switch-mbedtls dkp-toolchain-vars cmake ninja python git
+      - run: bash scripts/build-companion.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SwitchDesk-companion
+          path: artifacts/Switch/

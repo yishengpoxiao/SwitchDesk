@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <!-- The shared FTP fixture exposes fault flags intentionally left at defaults. -->
+    <NoWarn>$(NoWarn);CS0649</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/SwitchDesk.Core/SwitchDesk.Core.csproj" />
+    <Compile Include="../SwitchDesk.Tests/FtpMockServer.cs" Link="FtpMockServer.cs" />
+  </ItemGroup>
+</Project>
