@@ -57,10 +57,24 @@ jobs:
   companion:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    container: devkitpro/devkita64:latest
+    container: devkitpro/devkita64@sha256:1fc388c3a0d34bd2045a6dadcb1020e069d5f876a187fd705de14b4440c00282
     steps:
       - uses: actions/checkout@v4
-      - run: dkp-pacman -Syu --noconfirm --needed switch-dev switch-cmake deko3d switch-curl switch-glm switch-zlib switch-mbedtls dkp-toolchain-vars
+      # The official image already contains switch-dev and switch-portlibs.
+      - name: Verify preinstalled Switch build dependencies
+        shell: bash
+        run: |
+          dkp-pacman -Q
+          for tool in cmake ninja python3 make patch pkg-config git elf2nro nacptool; do
+            command -v "$tool"
+          done
+          "$DEVKITPRO/devkitA64/bin/aarch64-none-elf-g++" --version
+          for file in cmake/Switch.cmake libnx/lib/libnx.a libnx/lib/libdeko3d.a \
+            portlibs/switch/include/glm/glm.hpp portlibs/switch/lib/libcurl.a \
+            portlibs/switch/lib/libz.a portlibs/switch/lib/libmbedtls.a \
+            portlibs/switch/lib/libmbedcrypto.a portlibs/switch/lib/libmbedx509.a; do
+            test -s "$DEVKITPRO/$file"
+          done
       - run: bash scripts/build-companion.sh
       - uses: actions/upload-artifact@v4
         with:

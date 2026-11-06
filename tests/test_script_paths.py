@@ -22,8 +22,9 @@ class ScriptPathTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="SwitchDesk-script-path-tests-")
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name) / "project"
-        self.caller = Path(self.temporary.name) / "caller"
+        temporary = Path(self.temporary.name).resolve()
+        self.root = temporary / "project"
+        self.caller = temporary / "caller"
         (self.root / "scripts").mkdir(parents=True)
         self.caller.mkdir()
 
